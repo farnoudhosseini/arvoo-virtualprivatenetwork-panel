@@ -26,7 +26,10 @@ ExecStart=/usr/bin/node /opt/arvoo/apps/agent/dist/firewall-cli.js --spool /var/
 TimeoutStartSec=180
 # ufw writes its rule files here; /etc/arvoo holds the record of what Arvoo
 # applied so a later update can withdraw exactly those rules.
-ReadWritePaths=/etc/ufw /var/lib/ufw /etc/arvoo /var/lib/arvoo
+# "-" makes systemd ignore a path that does not exist instead of failing the
+# unit with status=226/NAMESPACE; install.sh creates both paths before this unit
+# is started.
+ReadWritePaths=-/etc/ufw -/var/lib/ufw /etc/arvoo /var/lib/arvoo
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true

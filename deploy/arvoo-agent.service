@@ -62,8 +62,16 @@ PrivateDevices=true
 #                          "Config & Enable UFW"/"Update UFW" action targets
 #                          this node; rules the operator added by hand are never
 #                          touched (only the ids Arvoo applied are withdrawn).
+#
+# The ufw paths are prefixed with "-" so systemd ignores them when they do not
+# exist. Without that prefix a host where ufw's directories are absent (ufw not
+# installed, or a minimal image) refused to start the agent at all:
+#   Failed to set up mount namespacing: /var/lib/ufw: No such file or directory
+#   status=226/NAMESPACE
+# install.sh also creates them before this unit is enabled; the prefix means a
+# later removal cannot take the agent down with it.
 ProtectSystem=strict
-ReadWritePaths=/etc/arvoo /etc/systemd/system /var/lib/arvoo /run /etc/ufw /var/lib/ufw
+ReadWritePaths=/etc/arvoo /etc/systemd/system /var/lib/arvoo /run -/etc/ufw -/var/lib/ufw
 ProtectHome=true
 # Required for `sysctl -w net.ipv4.ip_forward=1`; the value is also applied
 # persistently at install time, so this is only a fallback path.

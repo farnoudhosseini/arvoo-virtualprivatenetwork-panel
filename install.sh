@@ -143,7 +143,7 @@ install_system_packages() {
     ca-certificates curl gnupg lsb-release \
     nginx postgresql postgresql-contrib libpq-dev \
     certbot python3-certbot-nginx git \
-    iproute2 iptables openvpn > /dev/null
+    iproute2 iptables ufw openvpn > /dev/null
 
   # Node.js LTS from NodeSource (Ubuntu 24.04 ships Node 18 in universe, too
   # old for this project which requires >= 22.5).
@@ -197,29 +197,103 @@ run_as_app() {
   fi
 }
 
+# ---------------------------------------------------------------------------
+# Checkout detection
+#
+# The installer runs in two different ways and must handle both:
+#   A) from inside a full clone/export of the repository - that tree is used;
+#   B) piped from curl (`curl .../install.sh | bash -s --`) - then there are no
+#      repository files next to the script at all, and the current working
+#      directory is NOT a checkout ($0 is just "bash"). Treating it as one
+#      staged /opt/arvoo with a single file in it, so deploy/*.service,
+#      cli/arvoo and site/ were missing; treating the operator's cwd as one also
+#      copied unrelated (possibly secret) files into /opt/arvoo.
+# The layout is therefore detected explicitly, and the repository is cloned
+# when a checkout cannot be seen.
+# ---------------------------------------------------------------------------
+
+DEFAULT_SOURCE_URL="https://github.com/farnoudhosseini/arvoo-virtualprivatenetwork-panel.git"
+
+# A directory is a usable checkout only when everything the installer
+# installs from the repository is actually there.
+looks_like_checkout() {
+  local dir="${1:-}"
+  [[ -n "$dir" && -d "$dir" ]] || return 1
+  [[ -f "$dir/install.sh" && -f "$dir/package.json" && -d "$dir/apps" && -d "$dir/deploy" && -d "$dir/cli" ]]
+}
+
+# Directory this script lives in. Prints nothing when the script was piped from
+# stdin, because then $0 is "bash" and its directory means nothing.
+script_dir() {
+  local src="$0"
+  [[ -f "$src" ]] || return 1
+  ( cd "$(dirname "$(readlink -f "$src")")" 2>/dev/null && pwd )
+}
+
+# Fail immediately, with a list of what is missing, instead of halfway through
+# an install that assumes deploy/ and cli/ exist.
+require_checkout_layout() {
+  local missing=() f
+  for f in install.sh package.json apps deploy cli; do
+    [[ -e "${INSTALL_ROOT}/${f}" ]] || missing+=("${f}")
+  done
+  for f in deploy/arvoo.service deploy/arvoo-agent.service deploy/nginx-common.conf deploy/nginx-arvoo.conf; do
+    [[ -f "${INSTALL_ROOT}/${f}" ]] || missing+=("${f}")
+  done
+  if (( ${#missing[@]} > 0 )); then
+    abort "the checkout at ${INSTALL_ROOT} is incomplete (missing: ${missing[*]}). Run the installer from a full clone, or set ARVOO_SOURCE_URL to a git URL it can fetch."
+  fi
+}
+
 ensure_checkout() {
   step "Ensuring application checkout at ${INSTALL_ROOT}"
-  local src
-  src="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+  local src=""
+  src="$(script_dir || true)"
 
-  if [[ ! -d "$INSTALL_ROOT/.git" ]]; then
-    if [[ -n "${ARVOO_SOURCE_URL:-}" ]]; then
-      git clone --depth 1 "${ARVOO_SOURCE_URL}" "$INSTALL_ROOT"
-    elif [[ "$src" == "$INSTALL_ROOT" ]]; then
-      log "installer is already running from ${INSTALL_ROOT}; using it in place"
+  if [[ -d "$INSTALL_ROOT/.git" ]]; then
+    log "git checkout already present at ${INSTALL_ROOT}"
+  elif looks_like_checkout "$src"; then
+    if [[ "$src" == "$INSTALL_ROOT" ]]; then
+      log "installer is running from ${INSTALL_ROOT}; using it in place"
     else
-      # Not a git checkout: copy the current tree (installer shipped in-tree).
+      log "staging the checkout this installer runs from (${src})"
+      mkdir -p "$INSTALL_ROOT"
       # node_modules, build output and any local .env are deliberately not
       # copied: dependencies are installed fresh and secrets stay in ${ENV_FILE}.
-      mkdir -p "$INSTALL_ROOT"
       tar -C "$src" --exclude=node_modules --exclude='*/node_modules' \
           --exclude=dist --exclude='*/dist' --exclude=.env --exclude='.freebuff' \
           -cf - . | tar -C "$INSTALL_ROOT" -xf -
     fi
-    ok "application staged at ${INSTALL_ROOT}"
+    ok "application staged from ${src}"
   else
-    log "git checkout already present at ${INSTALL_ROOT}"
+    if [[ -n "$src" ]]; then
+      warn "installer is not running from a full checkout (${src} has no apps/ deploy/ cli/); fetching the repository instead"
+    else
+      log "installer was piped from stdin; fetching the repository into ${INSTALL_ROOT}"
+    fi
+    command_exists git || abort "git is required to fetch the repository (apt-get install -y git), or run install.sh from a full clone"
+    local url="${ARVOO_SOURCE_URL:-$DEFAULT_SOURCE_URL}"
+    local tmp
+    if [[ -d "$INSTALL_ROOT" && -n "$(ls -A "$INSTALL_ROOT" 2>/dev/null || true)" ]]; then
+      # A non-empty directory that is not a checkout is never deleted: the
+      # repository is fetched into a temporary directory and staged from there.
+      tmp="$(mktemp -d)"
+      git clone --quiet --depth 1 "$url" "$tmp/repo" \
+        || { rm -rf "$tmp"; abort "git clone ${url} failed; set ARVOO_SOURCE_URL to a reachable repository URL"; }
+      tar -C "$tmp/repo" --exclude=node_modules --exclude='*/node_modules' \
+          --exclude=dist --exclude='*/dist' --exclude=.env --exclude='.freebuff' \
+          -cf - . | tar -C "$INSTALL_ROOT" -xf -
+      rm -rf "$tmp"
+      warn "staged the repository into the existing ${INSTALL_ROOT}; it is not a git checkout, so ./install.sh --update needs one"
+    else
+      mkdir -p "$INSTALL_ROOT"
+      git clone --quiet --depth 1 "$url" "$INSTALL_ROOT" \
+        || abort "git clone ${url} failed; set ARVOO_SOURCE_URL to a reachable repository URL"
+    fi
+    ok "repository fetched from ${url}"
   fi
+
+  require_checkout_layout
   chown -R "${APP_USER}:${APP_GROUP}" "$INSTALL_ROOT"
 }
 
@@ -342,9 +416,33 @@ pg_app_can_connect() {
 url_password() { printf '%s' "$1" | sed -E 's#^postgres(ql)?://[^:]*:([^@]*)@.*$#\2#'; }
 url_host()     { printf '%s' "$1" | sed -E 's#^postgres(ql)?://[^@]*@([^:/]+).*$#\2#'; }
 
+# Create the application login role, or update it when it already exists. Both
+# the first and every later run of the installer must succeed:
+#   * `ALTER ROLE` alone failed on a freshly installed PostgreSQL with
+#     "role \"${DB_USER}\" does not exist", and that failure was easy to miss
+#     because psql's exit status was not checked - the run continued with a
+#     DATABASE_URL whose password did not exist in the cluster.
+#   * one statement does it, so there is no check-then-act race, and the DO
+#     block is executed by PostgreSQL itself instead of parsing psql output.
+#   * the password is escaped for a SQL literal (single quotes doubled; the
+#     generated value is alphanumeric anyway).
+#   * the password travels on stdin - never in argv (/proc/*/cmdline is public),
+#     and never in the output: `psql -q` prints no statement text.
+#   * ON_ERROR_STOP=1 (psql_super) makes a failure return non-zero, which the
+#     caller checks instead of assuming success.
 set_role_password() {
+  local password="$1" escaped
+  escaped="$(printf '%s' "$password" | sed "s/'/''/g")"
   psql_super <<SQL
-ALTER ROLE ${DB_USER} WITH LOGIN PASSWORD '${1}';
+DO \$\$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = '${DB_USER}') THEN
+    CREATE ROLE ${DB_USER} LOGIN PASSWORD '${escaped}';
+  ELSE
+    ALTER ROLE ${DB_USER} WITH LOGIN PASSWORD '${escaped}';
+  END IF;
+END
+\$\$;
 SQL
 }
 
@@ -386,7 +484,7 @@ SQL
 
   if [[ "$role_exists" != "1" ]]; then
     pw="$(rand_pw)"
-    set_role_password "$pw"
+    set_role_password "$pw" || abort "could not create the database role '${DB_USER}' (see the PostgreSQL output above)"
     env_set DATABASE_URL "postgresql://${DB_USER}:${pw}@${PG_HOST}:${PG_PORT}/${DB_NAME}"
     db_url="$(env_get DATABASE_URL)"
     ok "created dedicated role '${DB_USER}' (generated password stored in ${ENV_FILE})"
@@ -395,7 +493,7 @@ SQL
     if [[ -z "$db_url" ]]; then
       # Repair path: role exists but the env file lost its connection string.
       pw="$(rand_pw)"
-      set_role_password "$pw"
+      set_role_password "$pw" || abort "could not reset the password of role '${DB_USER}'"
       env_set DATABASE_URL "postgresql://${DB_USER}:${pw}@${PG_HOST}:${PG_PORT}/${DB_NAME}"
       db_url="$(env_get DATABASE_URL)"
       warn "${ENV_FILE} had no DATABASE_URL; role password rotated and connection string restored"
@@ -697,7 +795,13 @@ configure_https() {
 }
 
 render_tls_site() {
-  cat > /etc/nginx/sites-available/arvoo <<NGINX
+  # `http2 on;` is a directive that only exists in nginx >= 1.25.1. Ubuntu 24.04
+  # ships nginx 1.24, where it aborts the whole configuration with
+  # "unknown directive \"http2\"". HTTP/2 is therefore enabled through the listen
+  # directive, which every nginx that can serve HTTP/2 understands.
+  # ARVOO_NGINX_SITE_FILE keeps the generated vhost verifiable in a test.
+  local target="${ARVOO_NGINX_SITE_FILE:-/etc/nginx/sites-available/arvoo}"
+  cat > "$target" <<NGINX
 upstream arvoo_api {
     server 127.0.0.1:${API_PORT};
     keepalive 32;
@@ -718,9 +822,8 @@ server {
 }
 
 server {
-    listen 443 ssl;
-    listen [::]:443 ssl;
-    http2 on;
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
     server_name ${ARVOO_DOMAIN};
 
     ssl_certificate     /etc/letsencrypt/live/${ARVOO_DOMAIN}/fullchain.pem;
@@ -848,6 +951,9 @@ install_host_tuning() {
   mkdir -p /etc/arvoo /var/lib/arvoo
   chmod 0700 /etc/arvoo /var/lib/arvoo
 
+  # ufw paths: the units list them in ReadWritePaths (see ensure_ufw_dirs).
+  ensure_ufw_dirs
+
   # Firewall request spool: the unprivileged API drops a plan here, the root
   # helper (arvoo-ufw-apply.service) applies it and writes the result back. The
   # API can only create/modify files in this directory - never run ufw itself.
@@ -866,11 +972,28 @@ install_host_tuning() {
     warn "could not reload sysctl now; values apply on the next boot"
   fi
 
-  ok "integration paths ready (/etc/arvoo, /var/lib/arvoo - mode 0700)"
+  ok "host integration paths ready (/etc/arvoo, /var/lib/arvoo - mode 0700)"
+}
+
+# ufw keeps its rule files in /var/lib/ufw and its configuration in /etc/ufw.
+# Both are listed in the agent unit's ReadWritePaths, and systemd refuses to
+# start a unit whose ReadWritePaths entry does not exist:
+#   Failed to set up mount namespacing: /var/lib/ufw: No such file or directory
+#   status=226/NAMESPACE
+# which is how a host without the ufw package could not run the agent at all.
+# The package is installed by the installer and this function creates the
+# directories idempotently before either unit is enabled; the units also use the
+# "-" prefix so a missing path can never break them again.
+ensure_ufw_dirs() {
+  install -d -m 0755 /var/lib/ufw
+  [[ -d /etc/ufw ]] || install -d -m 0755 /etc/ufw
+  ok "ufw paths ready (/etc/ufw, /var/lib/ufw - safe to re-run)"
 }
 
 firewall_rules() {
-  command_exists ufw || return 0
+  # ufw is installed by the installer; on a host where it was removed by hand
+  # the rules are simply left alone instead of failing the install.
+  command_exists ufw || { warn "ufw is not installed; firewall rules were not touched (apt-get install -y ufw)"; return 0; }
   if ! ufw status 2>/dev/null | grep -qi '^Status: active'; then
     log "ufw is installed but inactive; no firewall rules changed (HTTP/HTTPS/SSH are the only ports this stack needs)"
     return 0
@@ -1042,6 +1165,40 @@ SQL
 }
 
 mode_status() {
+  # A node-only host has no panel to inspect. Reporting arvoo/postgresql/nginx
+  # as missing there is misleading, so the agent is reported instead.
+  if [[ ! -f /etc/systemd/system/arvoo.service && ! -f "$ENV_FILE" ]]; then
+    step "Arvoo node status (no panel on this host)"
+    local node_failed=0 node_state
+    if command_exists systemctl && systemctl is-active --quiet arvoo-agent 2>/dev/null; then
+      ok "arvoo-agent.service active"
+    else
+      node_state="$(systemctl is-active arvoo-agent 2>/dev/null || echo 'not installed')"
+      fail "arvoo-agent.service ${node_state}"
+      node_failed=1
+    fi
+    if [[ "$(systemctl is-enabled arvoo-agent 2>/dev/null || true)" == "enabled" ]]; then
+      ok "arvoo-agent.service enabled (starts on boot)"
+    else
+      warn "arvoo-agent.service is not enabled (systemctl enable arvoo-agent)"
+    fi
+    if [[ -r "${AGENT_STATE_DIR}/agent-state.json" ]]; then
+      ok "node identity present (${AGENT_STATE_DIR}/agent-state.json, mode $(stat -c '%a' "${AGENT_STATE_DIR}/agent-state.json" 2>/dev/null))"
+    else
+      fail "node identity missing - enroll this host: ./install.sh --node"
+      node_failed=1
+    fi
+    if [[ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null || true)" == "1" ]]; then
+      ok "net.ipv4.ip_forward enabled (a node must forward)"
+    else
+      warn "net.ipv4.ip_forward is not 1; check /etc/sysctl.d/99-arvoo.conf"
+    fi
+    echo
+    if [[ "$node_failed" -eq 0 ]]; then ok "status: healthy (node)"; return 0; fi
+    fail "status: degraded (see the FAIL lines above)"
+    return 1
+  fi
+
   step "Arvoo service status"
   local failed=0 state
   local unit
@@ -1135,8 +1292,31 @@ SQL
   return 1
 }
 
+# The node id recorded in the agent identity file (empty when there is none).
+agent_node_id() {
+  local state_file="${AGENT_STATE_DIR}/agent-state.json"
+  [[ -r "$state_file" ]] || return 0
+  sed -n 's/.*"nodeId"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$state_file" | head -n1
+}
+
 mode_restart() {
   require_root
+  # A node has no panel to restart; restarting arvoo/nginx there would only
+  # produce failures for services that are deliberately not installed.
+  if [[ ! -f /etc/systemd/system/arvoo.service && ! -f "$ENV_FILE" ]]; then
+    step "Restarting the node agent"
+    local before after
+    before="$(agent_node_id)"
+    systemctl restart arvoo-agent || abort "arvoo-agent failed to restart (inspect: journalctl -u arvoo-agent -n 50)"
+    sleep 2
+    systemctl is-active --quiet arvoo-agent || abort "arvoo-agent is not active after the restart"
+    after="$(agent_node_id)"
+    if [[ -n "$before" && "$before" != "$after" ]]; then
+      abort "the restart changed the node identity (${before} -> ${after})"
+    fi
+    ok "arvoo-agent restarted${after:+ (node ${after}, identity preserved)}"
+    return 0
+  fi
   step "Restarting application services"
   systemctl restart arvoo
   systemctl reload nginx 2>/dev/null || systemctl restart nginx
@@ -1459,6 +1639,26 @@ enroll_agent() {
   [[ -f "$AGENT_ENTRY" ]] || abort "agent build not found at ${AGENT_ENTRY}"
   command_exists node || abort "Node.js is required to run the agent"
 
+  local state_file="${AGENT_STATE_DIR}/agent-state.json"
+
+  # Already enrolled: a re-run of the installer (repair, update, or a second
+  # `--node` run) must never need a new one-time token and must never create a
+  # second node. The identity on disk is reused, exactly as it is across service
+  # restarts. No control plane round trip is required here, so a repair works
+  # while the panel is down.
+  if [[ -r "$state_file" ]]; then
+    local existing_url=""
+    existing_url="$(ask_control_plane_url 2>/dev/null || true)"
+    if [[ -z "$existing_url" ]]; then
+      existing_url="$(sed -n 's/.*"controlPlaneUrl"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$state_file" | head -n1)"
+    fi
+    [[ -n "$existing_url" ]] \
+      || abort "this host is already enrolled but its control plane URL could not be determined; re-run with ARVOO_CONTROL_PLANE_URL=https://panel.example.com"
+    write_agent_env "$existing_url"
+    ok "already enrolled (node $(agent_node_id)); enrollment skipped, no new token needed"
+    return 0
+  fi
+
   local url; url="$(ask_control_plane_url)"
   validate_control_plane "$url"
   write_agent_env "$url"
@@ -1489,10 +1689,10 @@ enroll_agent() {
     abort "enrollment failed. Tokens are single use and short lived: generate a new one in the panel and re-run ./install.sh --node"
   fi
   printf '%s\n' "$output"
-  [[ -f "${AGENT_STATE_DIR}/agent-state.json" ]] \
+  [[ -f "$state_file" ]] \
     || abort "enrollment reported success but no identity was written to ${AGENT_STATE_DIR}; refusing to continue"
-  chmod 0600 "${AGENT_STATE_DIR}/agent-state.json"
-  ok "node identity created (${AGENT_STATE_DIR}/agent-state.json, mode 0600)"
+  chmod 0600 "$state_file"
+  ok "node identity created (${state_file}, mode 0600)"
 }
 
 mode_install_node() {
@@ -1508,7 +1708,7 @@ mode_install_node() {
   # offers a feature when the node confirms it, so a missing package never
   # results in a configuration that silently does nothing.
   apt-get install -y -qq \
-    ca-certificates curl iproute2 iptables nftables ethtool iperf3 \
+    ca-certificates curl iproute2 iptables nftables ufw ethtool iperf3 \
     openvpn strongswan-swanctl charon-systemd kmod > /dev/null \
     || abort "package installation failed"
 
@@ -1524,6 +1724,10 @@ mode_install_node() {
   [[ -f "${NODE_AGENT_ROOT}/apps/agent/dist/index.js" ]] \
     || abort "agent build not found at ${NODE_AGENT_ROOT}/apps/agent/dist/index.js; copy the checkout there and run: npm ci && npm run build -w apps/agent"
   install -d -m 0750 /var/lib/arvoo /etc/arvoo
+  # Must exist before the agent unit is enabled: its ReadWritePaths contain
+  # /etc/ufw and /var/lib/ufw, and a missing path makes systemd fail the unit
+  # with status=226/NAMESPACE before the agent ever runs.
+  ensure_ufw_dirs
   install -m 0644 "${NODE_AGENT_ROOT}/deploy/arvoo-agent.service" /etc/systemd/system/arvoo-agent.service
   install_cli
   systemctl daemon-reload
@@ -1553,6 +1757,25 @@ mode_install_node() {
   local reported=""
   reported="$(ARVOO_AGENT_STATE_DIR="$AGENT_STATE_DIR" node "$AGENT_ENTRY" status 2>/dev/null || true)"
   [[ -n "$reported" ]] && printf '%s\n' "$reported" | sed 's/^/  /'
+
+  # Restart safety is verified here, not assumed: the identity in
+  # ${AGENT_STATE_DIR}/agent-state.json must survive a service restart, and no
+  # new enrollment may happen (a fresh token must never be needed for that).
+  step "Verifying restart safety"
+  local id_before="" id_after=""
+  id_before="$(agent_node_id)"
+  systemctl restart arvoo-agent || abort "arvoo-agent failed to restart (inspect: journalctl -u arvoo-agent -n 50)"
+  sleep 3
+  if ! systemctl is-active --quiet arvoo-agent; then
+    journalctl -u arvoo-agent -n 30 --no-pager >&2 || true
+    abort "arvoo-agent did not come back after a restart"
+  fi
+  id_after="$(agent_node_id)"
+  if [[ -n "$id_before" && "$id_before" == "$id_after" ]]; then
+    ok "arvoo-agent restarts cleanly with the same identity (${id_after}); no re-enrollment needed"
+  else
+    abort "a restart changed the node identity (${id_before:-none} -> ${id_after:-none}); the agent must reload ${AGENT_STATE_DIR}/agent-state.json instead of enrolling again"
+  fi
 
   ok "node-only install complete."
   ok "the panel will offer only the features this node confirms (see Node > Capabilities)"
@@ -1714,4 +1937,13 @@ main() {
   esac
 }
 
-main "$@"
+# Only run when executed: the file is also sourced by the test suite, which
+# calls individual functions (looks_like_checkout, render_tls_site, ...).
+#
+# When the script is piped in (`curl .../install.sh | bash -s --`) bash reports
+# an EMPTY BASH_SOURCE[0] with $0 set to "bash", which is the documented install
+# method - so an empty value must count as "executed" too. Without that the
+# guard silently skipped main() and the command did nothing at all.
+if [[ -z "${BASH_SOURCE[0]:-}" || "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

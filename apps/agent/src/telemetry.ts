@@ -49,6 +49,20 @@ function execProbe(cmd: string, args: string[], timeoutMs = 4000): Promise<strin
   });
 }
 
+/**
+ * Probe that reads the command's output even when it exits non-zero - `systemctl
+ * is-active` prints "inactive"/"failed" and returns 1, and that answer is the
+ * useful one. Returns null when nothing was printed (tool missing, timeout).
+ */
+function execProbeAny(cmd: string, args: string[], timeoutMs = 4000): Promise<string | null> {
+  return new Promise((resolve) => {
+    execFile(cmd, args, { timeout: timeoutMs }, (_err, stdout) => {
+      const text = stdout?.toString().trim();
+      resolve(text ? text : null);
+    });
+  });
+}
+
 export async function collectTelemetry(): Promise<{ telemetry: NodeTelemetry; extras: TelemetryExtras }> {
   const memTotal = os.totalmem();
   const memFree = os.freemem();
@@ -85,11 +99,18 @@ export async function collectTelemetry(): Promise<{ telemetry: NodeTelemetry; ex
 
   const services: Array<{ name: string; status: "running" | "stopped" | "unknown" }> = [];
   if (isLinux) {
-    const out = await execProbe("systemctl", ["is-active", "node-agent", "openvpn@*", "--quiet"], 3000);
-    void out;
-    services.push({ name: "node-agent", status: "running" });
+    // Read the state of the unit this agent really runs as. It used to push a
+    // hardcoded "running", which made the panel show a healthy agent even when
+    // the service was failing, and it probed a unit name (node-agent) that does
+    // not exist on an Arvoo installation.
+    const active = await execProbeAny("systemctl", ["is-active", "arvoo-agent"], 3000);
+    services.push({
+      name: "arvoo-agent",
+      status: active === null ? "unknown" : active === "active" ? "running" : "stopped",
+    });
   } else {
-    services.push({ name: "node-agent", status: "running" });
+    // Not Linux: this very process is the agent loop, so it is running.
+    services.push({ name: "arvoo-agent", status: "running" });
   }
 
   const telemetry: NodeTelemetry = {

@@ -28,6 +28,7 @@ set -uo pipefail
 
 INSTALL_ROOT="${ARVOO_INSTALL_ROOT:-/opt/arvoo}"
 ENV_FILE="${ARVOO_ENV_FILE:-/etc/arvoo.env}"
+AGENT_ENV_FILE="${ARVOO_AGENT_ENV_FILE:-/etc/arvoo/agent.env}"
 AGENT_STATE_FILE="${ARVOO_AGENT_STATE_FILE:-/var/lib/arvoo/agent-state.json}"
 BACKUP_DIR="${ARVOO_BACKUP_DIR:-/var/backups/arvoo}"
 LOG_LINES="${ARVOO_CLI_LOG_LINES:-200}"
@@ -41,6 +42,10 @@ ASSUME_YES=0
 FOLLOW=0
 COMPONENT=""
 RESTORE_FILE=""
+# Host role: a panel host and a managed node run different stacks. It is
+# detected from what is actually installed; ARVOO_HOST_ROLE=panel|node-only
+# forces it (automation, and the CLI tests).
+HOST_ROLE="${ARVOO_HOST_ROLE:-auto}"
 
 EXIT_OK=0
 EXIT_FAIL=1
@@ -116,12 +121,62 @@ confirm() {
   esac
 }
 
-unit_exists() { systemctl list-unit-files "$1" >/dev/null 2>&1 && systemctl cat "$1" >/dev/null 2>&1; }
+# ---------------------------------------------------------------------------
+# Unit detection and host role
+# ---------------------------------------------------------------------------
+
+# `systemctl list-unit-files <unit>` is NOT a reliable existence test: for a unit
+# that was installed by an installer rather than a distribution package - which
+# is exactly what arvoo-agent is - it prints "0 unit files listed." and exits 1,
+# so this CLI reported "agent unit: absent" for a node whose agent was active.
+# `systemctl show -p LoadState` asks systemd itself and answers correctly for
+# every unit kind (arvoo, arvoo-agent, nginx, postgresql) without depending on
+# the unit file being tracked by the package manager.
+unit_load_state() { systemctl show "$1" -p LoadState --value 2>/dev/null || true; }
+
+unit_exists() {
+  local unit="${1:-}"
+  [[ -n "$unit" ]] || return 1
+  [[ "$(unit_load_state "$unit")" == "loaded" ]]
+}
 
 unit_state() {
   local unit="$1"
   if ! unit_exists "$unit"; then printf 'absent'; return; fi
   systemctl is-active "$unit" 2>/dev/null || true
+}
+
+# The role decides which checks are meaningful. A node-only host deliberately
+# has no control plane, PostgreSQL or nginx: those are not "missing", so they
+# are not checked and not reported as failures.
+host_role() {
+  if [[ "$HOST_ROLE" == "panel" || "$HOST_ROLE" == "node-only" ]]; then
+    printf '%s' "$HOST_ROLE"
+    return 0
+  fi
+  if unit_exists arvoo || [[ -e "$ENV_FILE" ]]; then printf 'panel'; else printf 'node-only'; fi
+}
+
+on_node() { [[ "$(host_role)" == "node-only" ]]; }
+
+# Units this host's `start`/`restart` manages, in dependency order. A node
+# manages only the agent - nginx or PostgreSQL that merely happen to be
+# installed next to it are not part of the Arvoo stack and are left alone.
+managed_units_start() {
+  if on_node; then printf 'arvoo-agent\n'; return 0; fi
+  printf 'postgresql\narvoo\nnginx\n'
+  unit_exists arvoo-agent && printf 'arvoo-agent\n'
+  return 0
+}
+
+# Stop order is the reverse of start order. PostgreSQL is deliberately never
+# stopped: `arvoo stop` takes the presentation tier down, it does not drop the
+# data plane.
+managed_units_stop() {
+  if on_node; then printf 'arvoo-agent\n'; return 0; fi
+  printf 'nginx\narvoo\n'
+  unit_exists arvoo-agent && printf 'arvoo-agent\n'
+  return 0
 }
 
 # Read one value from /etc/arvoo.env without printing or exporting anything else.
@@ -160,7 +215,14 @@ api_login_token() {
 # ---------------------------------------------------------------------------
 
 service_rows() {
-  local units=(arvoo arvoo-agent nginx postgresql)
+  local units
+  if on_node; then
+    units=(arvoo-agent)
+  else
+    units=(arvoo nginx postgresql)
+    # A panel host can also be enrolled as a node.
+    unit_exists arvoo-agent && units+=(arvoo-agent)
+  fi
   local unit state
   for unit in "${units[@]}"; do
     state="$(unit_state "$unit")"
@@ -169,8 +231,44 @@ service_rows() {
   done
 }
 
+# Forwarding is what makes a node a node; read the kernel value instead of
+# assuming the sysctl drop-in was applied.
+forwarding_state() {
+  local value
+  value="$(sysctl -n net.ipv4.ip_forward 2>/dev/null || true)"
+  case "$value" in
+    1) printf 'enabled' ;;
+    0) printf 'disabled' ;;
+    *) printf 'unknown' ;;
+  esac
+}
+
+# Last heartbeat outcome, read from the journal instead of assumed.
+agent_heartbeat_state() {
+  have journalctl || { printf 'unknown'; return 0; }
+  local recent
+  recent="$(journalctl -u arvoo-agent --since '5 min ago' --no-pager -o cat 2>/dev/null | tail -n 40 || true)"
+  [[ -n "$recent" ]] || { printf 'unknown'; return 0; }
+  if printf '%s' "$recent" | grep -q 'heartbeat failed'; then printf 'failing'; return 0; fi
+  if printf '%s' "$recent" | grep -q 'heartbeat'; then printf 'healthy'; return 0; fi
+  printf 'unknown'
+}
+
+control_plane_state() {
+  local url="$1"
+  [[ -n "$url" ]] || { printf 'unknown'; return 0; }
+  if curl -fsS --max-time 8 "${url%/}/health" >/dev/null 2>&1; then printf 'reachable'; else printf 'unreachable'; fi
+}
+
 cmd_status() {
   require_linux
+  local role; role="$(host_role)"
+
+  if [[ "$role" == "node-only" ]]; then
+    cmd_status_node
+    return
+  fi
+
   local health="unreachable" api_state db_state
   api_state="$(unit_state arvoo)"
   db_state="$(unit_state postgresql)"
@@ -184,7 +282,7 @@ cmd_status() {
   fi
 
   if [[ "$JSON" == "1" ]]; then
-    printf '{"services":['
+    printf '{"role":"panel","services":['
     local first=1 unit state
     while IFS=$'\t' read -r unit state; do
       [[ "$first" == "1" ]] || printf ','
@@ -198,6 +296,7 @@ cmd_status() {
   fi
 
   hdr "Arvoo status ($(cli_version))"
+  say "        host role:    $role"
   while IFS=$'\t' read -r unit state; do
     case "$state" in
       active) ok "$unit: $state" ;;
@@ -210,8 +309,61 @@ cmd_status() {
   return 0
 }
 
+# Node-only status: agent, enrollment and the link to the control plane. It is
+# never rendered as a broken panel.
+cmd_status_node() {
+  local node_id control agent_state enrolled="no" cp heartbeat forwarding
+  node_id="$(node_state_value nodeId || true)"
+  control="$(node_state_value controlPlaneUrl || true)"
+  agent_state="$(unit_state arvoo-agent)"
+  [[ -n "$node_id" ]] && enrolled="yes"
+  cp="$(control_plane_state "$control")"
+  heartbeat="$(agent_heartbeat_state)"
+  forwarding="$(forwarding_state)"
+
+  if [[ "$JSON" == "1" ]]; then
+    printf '{"role":"node-only","services":['
+    local first=1 unit state
+    while IFS=$'\t' read -r unit state; do
+      [[ "$first" == "1" ]] || printf ','
+      first=0
+      printf '{"unit":"%s","state":"%s"}' "$(json_escape "$unit")" "$(json_escape "$state")"
+    done < <(service_rows)
+    printf '],"agent":"%s","enrollment":"%s","nodeId":"%s","controlPlane":"%s","controlPlaneState":"%s","heartbeat":"%s","forwarding":"%s","version":"%s"}\n' \
+      "$(json_escape "$agent_state")" "$(json_escape "$enrolled")" "$(json_escape "${node_id:-}")" \
+      "$(json_escape "${control:-}")" "$(json_escape "$cp")" "$(json_escape "$heartbeat")" \
+      "$(json_escape "$forwarding")" "$(json_escape "$(cli_version)")"
+    return 0
+  fi
+
+  hdr "Node health ($(cli_version))"
+  say "        host role:     node-only"
+  if [[ "$agent_state" == "active" ]]; then ok "Agent:         $agent_state"; else fail "Agent:         $agent_state"; fi
+  if [[ "$enrolled" == "yes" ]]; then ok "Enrollment:    enrolled"; else fail "Enrollment:    not enrolled"; fi
+  [[ -n "$node_id" ]] && say "        node id:       $node_id"
+  case "$cp" in
+    reachable)   ok   "Control plane: reachable${control:+ ($control)}" ;;
+    unreachable) fail "Control plane: unreachable${control:+ ($control)}" ;;
+    *)           warn "Control plane: unknown (no URL recorded in $AGENT_STATE_FILE)" ;;
+  esac
+  case "$heartbeat" in
+    healthy) ok   "Heartbeat:     healthy" ;;
+    failing) fail "Heartbeat:     failing (journalctl -u arvoo-agent)" ;;
+    *)       warn "Heartbeat:     unknown (no recent journal entries)" ;;
+  esac
+  case "$forwarding" in
+    enabled)  ok   "Forwarding:    enabled" ;;
+    disabled) fail "Forwarding:    disabled (ip_forward must be 1 on a node)" ;;
+    *)        warn "Forwarding:    unknown" ;;
+  esac
+  return 0
+}
+
 cmd_health() {
   require_linux
+  # A node has no local API or database to health-check; the meaningful checks
+  # are the agent, its enrollment and the control plane link.
+  if on_node; then cmd_diagnostics; return 0; fi
   local code=0 body
   body="$(api_health)" || {
     fail "API health check failed ($(api_base)/health)"
@@ -249,10 +401,21 @@ run_units() {
   return "$failures"
 }
 
-cmd_start()   { require_linux; require_root start;   run_units start   postgresql arvoo nginx arvoo-agent; exit $?; }
-cmd_stop()    { require_linux; require_root stop;    confirm "stop the Arvoo stack (panel and agents become unavailable)"; run_units stop arvoo-agent arvoo nginx; exit $?; }
-cmd_restart() { require_linux; require_root restart; run_units restart arvoo; if unit_exists nginx; then systemctl reload nginx && ok "nginx reloaded (not restarted)"; fi; exit $?; }
-cmd_reload()  { require_linux; require_root reload;  run_units reload arvoo nginx; exit $?; }
+cmd_start()   { require_linux; require_root start;   run_units start   $(managed_units_start); exit $?; }
+cmd_stop()    { require_linux; require_root stop;    confirm "stop the Arvoo stack (panel and agents become unavailable)"; run_units stop $(managed_units_stop); exit $?; }
+cmd_restart() {
+  require_linux; require_root restart
+  if on_node; then run_units restart arvoo-agent; exit $?; fi
+  run_units restart arvoo
+  if unit_exists nginx; then systemctl reload nginx && ok "nginx reloaded (not restarted)"; fi
+  exit $?
+}
+cmd_reload()  {
+  require_linux; require_root reload
+  # The agent has no reload signal; re-reading its environment means a restart.
+  if on_node; then run_units restart arvoo-agent; exit $?; fi
+  run_units reload arvoo nginx; exit $?
+}
 
 # ---------------------------------------------------------------------------
 # diagnostics (spec §26)
@@ -260,6 +423,35 @@ cmd_reload()  { require_linux; require_root reload;  run_units reload arvoo ngin
 
 diag_rows=()
 add_diag() { diag_rows+=("$1|$2|$3"); }
+
+# Available memory in MiB. `free -m` is the canonical source and is used when
+# present; /proc/meminfo (MemAvailable is reported in kB, so it is divided by
+# 1024 exactly once) is the fallback, and ARVOO_MEMINFO_FILE overrides the file
+# so the parsing can be verified on any host. When neither source is readable
+# the function returns nothing: an unknown value must never be rendered as a
+# real measurement, which is how the CLI ended up claiming "only 0 MiB".
+memory_available_mib() {
+  local mib=""
+  if [[ -z "${ARVOO_MEMINFO_FILE:-}" ]] && have free; then
+    mib="$(free -m 2>/dev/null | awk '/^Mem:/ {print $7}')"
+    if [[ "$mib" =~ ^[0-9]+$ ]]; then printf '%s' "$mib"; return 0; fi
+  fi
+  local file="${ARVOO_MEMINFO_FILE:-/proc/meminfo}"
+  [[ -r "$file" ]] || return 1
+  mib="$(awk '
+    /^MemAvailable:/ {avail = $2; found = 1}
+    /^MemFree:/       {free = $2}
+    /^Buffers:/       {buffers = $2}
+    /^Cached:/        {cached = $2}
+    END {
+      # Kernels without MemAvailable (pre-3.14) still get a real figure
+      # instead of a fabricated zero.
+      if (found) printf "%d", avail / 1024;
+      else if (free != "") printf "%d", (free + buffers + cached) / 1024;
+    }' "$file" 2>/dev/null || true)"
+  [[ "$mib" =~ ^[0-9]+$ ]] || return 1
+  printf '%s' "$mib"
+}
 
 cmd_diagnostics() {
   require_linux
@@ -269,39 +461,51 @@ cmd_diagnostics() {
   if [[ -n "$root_use" ]] && (( root_use < 85 )); then add_diag "Disk" "ok" "root filesystem ${root_use}% used"
   elif [[ -n "$root_use" ]]; then add_diag "Disk" "warn" "root filesystem ${root_use}% used"; else add_diag "Disk" "warn" "usage unknown"; fi
 
-  local mem_avail; mem_avail="$(awk '/MemAvailable/ {printf "%d", $2/1024/1024}' /proc/meminfo 2>/dev/null || true)"
-  if [[ -n "$mem_avail" ]] && (( mem_avail > 200 )); then add_diag "Memory" "ok" "${mem_avail} MiB available"
-  elif [[ -n "$mem_avail" ]]; then add_diag "Memory" "warn" "only ${mem_avail} MiB available"; else add_diag "Memory" "warn" "usage unknown"; fi
+  local mem_avail=""
+  mem_avail="$(memory_available_mib || true)"
+  if [[ "$mem_avail" =~ ^[0-9]+$ ]] && (( mem_avail > 200 )); then add_diag "Memory" "ok" "${mem_avail} MiB available"
+  elif [[ "$mem_avail" =~ ^[0-9]+$ ]]; then add_diag "Memory" "warn" "only ${mem_avail} MiB available"; else add_diag "Memory" "warn" "usage unknown"; fi
 
-  local unit state
-  for unit in arvoo arvoo-agent nginx postgresql; do
+  local units
+  if on_node; then units=(arvoo-agent); else units=(arvoo nginx postgresql); unit_exists arvoo-agent && units+=(arvoo-agent); fi
+  local unit state load_state
+  for unit in "${units[@]}"; do
+    load_state="$(unit_load_state "$unit")"
+    case "$load_state" in
+      ""|"not-found") continue ;;
+      masked|masked-runtime)
+        add_diag "$unit" "fail" "masked (systemctl unmask $unit)"; continue ;;
+    esac
     state="$(unit_state "$unit")"
-    [[ "$state" == "absent" ]] && continue
     if [[ "$state" == "active" ]]; then add_diag "$unit" "ok" "active"; else add_diag "$unit" "fail" "$state"; fi
   done
 
-  if have nginx && unit_exists nginx; then
-    if nginx -t >/dev/null 2>&1; then add_diag "nginx config" "ok" "nginx -t passed"
-    else add_diag "nginx config" "fail" "$(nginx -t 2>&1 | tail -n1)"; fi
+  # nginx, the API and PostgreSQL only exist on a panel host. On a node they are
+  # not "missing", so they are not checked at all.
+  if ! on_node; then
+    if have nginx && unit_exists nginx; then
+      if nginx -t >/dev/null 2>&1; then add_diag "nginx config" "ok" "nginx -t passed"
+      else add_diag "nginx config" "fail" "$(nginx -t 2>&1 | tail -n1)"; fi
+    fi
+
+    if api_health >/dev/null 2>&1; then add_diag "API" "ok" "healthy on port $(api_port)"
+    else add_diag "API" "fail" "$(api_base)/health unreachable"; fi
+
+    if have psql; then
+      if db_query 'SELECT 1' >/dev/null 2>&1; then add_diag "PostgreSQL" "ok" "accepts queries"
+      else add_diag "PostgreSQL" "fail" "cannot query (psql present)"; fi
+    elif unit_exists postgresql; then
+      add_diag "PostgreSQL" "warn" "psql not installed; service state only"
+    fi
+
+    if have ss; then
+      local exposed; exposed="$(ss -H -lnt 2>/dev/null | awk -v p=":$(api_port)" '$4 ~ p && $4 !~ /127\.0\.0\.1|\[::1\]/ {print $4}')"
+      if [[ -n "$exposed" ]]; then add_diag "API exposure" "fail" "listening on a public address: $exposed"
+      else add_diag "API exposure" "ok" "loopback only"; fi
+    fi
   fi
 
-  if api_health >/dev/null 2>&1; then add_diag "API" "ok" "healthy on port $(api_port)"
-  else add_diag "API" "fail" "$(api_base)/health unreachable"; fi
-
-  if have psql; then
-    if db_query 'SELECT 1' >/dev/null 2>&1; then add_diag "PostgreSQL" "ok" "accepts queries"
-    else add_diag "PostgreSQL" "fail" "cannot query (psql present)"; fi
-  elif unit_exists postgresql; then
-    add_diag "PostgreSQL" "warn" "psql not installed; service state only"
-  fi
-
-  if have ss; then
-    local exposed; exposed="$(ss -H -lnt 2>/dev/null | awk -v p=":$(api_port)" '$4 ~ p && $4 !~ /127\.0\.0\.1|\[::1\]/ {print $4}')"
-    if [[ -n "$exposed" ]]; then add_diag "API exposure" "fail" "listening on a public address: $exposed"
-    else add_diag "API exposure" "ok" "loopback only"; fi
-  fi
-
-  local cert_dir="/etc/letsencrypt/live"
+  local cert_dir="${ARVOO_CERT_DIR:-/etc/letsencrypt/live}"
   if [[ -d "$cert_dir" ]]; then
     local cert days end
     for cert in "$cert_dir"/*/fullchain.pem; do
@@ -315,12 +519,40 @@ cmd_diagnostics() {
       fi
     done
   else
-    add_diag "Certificate" "warn" "no ACME certificates present (IP-only installation?)"
+    # A node does not terminate TLS: the control plane does. An absent local
+    # certificate is the normal state there, not a finding.
+    if on_node; then add_diag "Certificate" "info" "not required on a node (TLS terminates on the control plane)"
+    else add_diag "Certificate" "warn" "no ACME certificates present (IP-only installation?)"; fi
   fi
 
   if have ip; then
     local gre; gre="$(ip -o link show 2>/dev/null | awk -F': ' '/gre|ip6gre/ {print $2}' | tr '\n' ' ')"
     if [[ -n "$gre" ]]; then add_diag "GRE" "ok" "interfaces: $gre"; else add_diag "GRE" "warn" "no GRE interface on this host"; fi
+  fi
+
+  if on_node; then
+    # Everything that makes a managed node useful: the agent, its identity, the
+    # link it reports to, and the forwarding it is responsible for.
+    local control cp heartbeat forwarding
+    control="$(node_state_value controlPlaneUrl || true)"
+    cp="$(control_plane_state "$control")"
+    heartbeat="$(agent_heartbeat_state)"
+    forwarding="$(forwarding_state)"
+    case "$cp" in
+      reachable)   add_diag "Control plane" "ok" "reachable (${control})" ;;
+      unreachable) add_diag "Control plane" "fail" "cannot reach ${control}/health" ;;
+      *)           add_diag "Control plane" "warn" "no control plane URL recorded" ;;
+    esac
+    case "$heartbeat" in
+      healthy) add_diag "Heartbeat" "ok" "recent heartbeats in the journal" ;;
+      failing) add_diag "Heartbeat" "fail" "heartbeats are failing (journalctl -u arvoo-agent)" ;;
+      *)       add_diag "Heartbeat" "warn" "no recent journal entries" ;;
+    esac
+    case "$forwarding" in
+      enabled)  add_diag "Forwarding" "ok" "net.ipv4.ip_forward = 1" ;;
+      disabled) add_diag "Forwarding" "fail" "net.ipv4.ip_forward = 0 (a node must forward)" ;;
+      *)        add_diag "Forwarding" "warn" "net.ipv4.ip_forward unknown" ;;
+    esac
   fi
 
   if unit_exists arvoo-agent; then
@@ -359,6 +591,7 @@ cmd_diagnostics() {
       IFS='|' read -r name status detail <<<"$row"
       case "$status" in
         ok)   ok   "$name — $detail" ;;
+        info) say "${C_DIM}$name — $detail${C_RESET}" ;;
         warn) warn "$name — $detail"; [[ "$worst" -lt 1 ]] && worst=1 ;;
         fail) fail "$name — $detail"; worst=2 ;;
       esac
@@ -377,14 +610,20 @@ cmd_diagnostics() {
 cmd_logs() {
   require_linux
   have journalctl || die "journalctl is required for logs"
+  # Default to the log source this host actually has.
   local unit="arvoo"
-  case "${COMPONENT:-master}" in
-    master|panel|api|"") unit="arvoo" ;;
+  if on_node; then unit="arvoo-agent"; fi
+  case "${COMPONENT:-}" in
+    master|panel|api) unit="arvoo" ;;
     node|agent) unit="arvoo-agent" ;;
     nginx) unit="nginx" ;;
     postgres|database) unit="postgresql" ;;
+    "") ;;
     *) die "unknown component '${COMPONENT}' (use: master, node, nginx, postgresql)" ;;
   esac
+  if on_node && [[ "$unit" != "arvoo-agent" ]]; then
+    die "'$unit' belongs to the panel host; this host is a node (use: arvoo logs --component node)"
+  fi
   local args=(--no-pager -n "$LOG_LINES" -u "$unit")
   [[ "$FOLLOW" == "1" ]] && args+=(-f)
   # Secrets never reach the journal from this CLI; it only reads.
@@ -408,7 +647,7 @@ cmd_node_status() {
   control="$(node_state_value controlPlaneUrl || true)"
   agent_state="$(unit_state arvoo-agent)"
   [[ -n "$node_id" ]] && enrolled="yes"
-  mode="panel"; unit_exists arvoo || mode="node-only"
+  mode="$(host_role)"
 
   if [[ "$JSON" == "1" ]]; then
     printf '{"mode":"%s","enrolled":%s,"nodeId":"%s","controlPlane":"%s","agent":"%s","stateFile":"%s"}\n' \
@@ -420,8 +659,11 @@ cmd_node_status() {
   say "        host role:    $mode"
   say "        enrolled:     $enrolled"
   [[ -n "$node_id" ]] && say "        node id:      $node_id"
-  [[ -n "$control" ]] && say "        control plane: $control"
   say "        agent unit:   $agent_state"
+  if [[ "$mode" == "node-only" ]]; then
+    say "        control plane: ${control:-unknown} ($(control_plane_state "$control"))"
+    say "        heartbeat:     $(agent_heartbeat_state)"
+  fi
   # The node secret is never printed, here or anywhere else in this CLI.
   [[ "$enrolled" == "yes" ]] || warn "not enrolled: run the installer (Install Node Agent) to enroll this host"
 }
@@ -628,7 +870,7 @@ management_show_response() {
 
 cmd_cert_status() {
   require_linux
-  local dir="/etc/letsencrypt/live" rows=() found=0
+  local dir="${ARVOO_CERT_DIR:-/etc/letsencrypt/live}" rows=() found=0
   if [[ -d "$dir" ]]; then
     local cert name end days
     for cert in "$dir"/*/fullchain.pem; do
@@ -654,7 +896,14 @@ cmd_cert_status() {
     return 0
   fi
   hdr "Certificate status"
-  if [[ "$found" == "0" ]]; then warn "no certificates under $dir (IP-only installation?)"; return 0; fi
+  if [[ "$found" == "0" ]]; then
+    if on_node; then
+      say "        no local certificate — not required on a node (TLS terminates on the control plane)"
+      else
+        warn "no certificates under $dir (IP-only installation?)"
+      fi
+    return 0
+  fi
   local row name end days
   for row in "${rows[@]}"; do
     IFS='|' read -r name end days <<<"$row"
@@ -667,6 +916,10 @@ cmd_cert_status() {
 cmd_cert_renew() {
   require_linux
   require_root "cert renew"
+  if on_node && ! have certbot; then
+    warn "certbot is not installed: a managed node does not terminate TLS (the control plane does)"
+    exit "$EXIT_OK"
+  fi
   have certbot || die "certbot is not installed; install it with the installer or apt"
   confirm "renew ACME certificates and reload the web server" || exit "$EXIT_OK"
   if certbot renew --quiet; then
@@ -696,7 +949,7 @@ cmd_repair() {
   confirm "repair the installation (idempotent: re-applies files, permissions, services and migrations; never deletes data)" || exit "$EXIT_OK"
   # install.sh is idempotent and preserves data; the node-only mode is detected
   # by what is actually installed, not by what the operator remembers.
-  if unit_exists arvoo; then
+  if ! on_node; then
     "$installer" || exit "$EXIT_FAIL"
   else
     "$installer" --node || exit "$EXIT_FAIL"
@@ -918,6 +1171,16 @@ cmd_security_audit() {
     owner="$(stat -c '%U' "$ENV_FILE" 2>/dev/null)"
     if [[ "$mode" == "640" || "$mode" == "600" || "$mode" == "440" ]]; then ok "$ENV_FILE mode $mode owned by $owner"
     else fail "$ENV_FILE mode is $mode; expected 640 or stricter"; problems=$((problems+1)); fi
+  elif on_node; then
+    # A node has no panel env file; the file that matters here is the agent's.
+    if [[ -e "$AGENT_ENV_FILE" ]]; then
+      local amode
+      amode="$(stat -c '%a' "$AGENT_ENV_FILE" 2>/dev/null)"
+      if [[ "$amode" == "640" || "$amode" == "600" ]]; then ok "$AGENT_ENV_FILE mode $amode"
+      else fail "$AGENT_ENV_FILE mode is $amode; expected 640 or stricter"; problems=$((problems+1)); fi
+    else
+      warn "$AGENT_ENV_FILE not present (agent not installed yet)"
+    fi
   else
     warn "$ENV_FILE not present (nothing to protect, or not installed yet)"
   fi
@@ -954,6 +1217,13 @@ cmd_security_audit() {
 
   if [[ -r /etc/ssh/sshd_config ]]; then
     if grep -qiE '^\s*PasswordAuthentication\s+yes' /etc/ssh/sshd_config; then warn "SSH password authentication is enabled"; else ok "SSH password authentication disabled"; fi
+  fi
+
+  if on_node; then
+    [[ "$JSON" == "1" ]] || say ""
+    if (( problems > 0 )); then fail "$problems local check(s) need attention"; exit "$EXIT_FAIL"; fi
+    ok "no local security problems found (control-plane posture is checked on the panel host)"
+    return 0
   fi
 
   if [[ "$JSON" != "1" ]]; then
@@ -993,7 +1263,7 @@ cmd_security_audit() {
 
 cmd_config() {
   require_linux
-  local mode="panel"; unit_exists arvoo || mode="node-only"
+  local mode; mode="$(host_role)"
   local db_masked="-"
   local url; url="$(env_file_value DATABASE_URL || true)"
   if [[ -n "$url" ]]; then
