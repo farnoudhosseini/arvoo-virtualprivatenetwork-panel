@@ -25,6 +25,18 @@ async function tableExists(name: string): Promise<boolean> {
   return rows[0]?.exists === true;
 }
 
+async function columnExists(table: string, column: string): Promise<boolean> {
+  const rows = await q<{ exists: boolean }>(
+    `SELECT EXISTS (
+       SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = $1 AND column_name = $2
+     ) AS exists`,
+    table,
+    column,
+  );
+  return rows[0]?.exists === true;
+}
+
 beforeAll(async () => {
   db = await createTestDatabase({ port: ISOLATED_PORT, databaseName: "arvoo_migrations" });
   openDatabase({ url: db.url, max: 4, applicationName: "arvoo-migrations-test" });
@@ -47,11 +59,13 @@ describe("shipped migrations", () => {
     expect(initial.reversible).toBe(true);
     const routing = rows.find((r) => r.name === "0003_routing_intelligence.sql")!;
     expect(routing.reversible).toBe(true);
+    const management = rows.find((r) => r.name === "0004_full_management.sql")!;
+    expect(management.reversible).toBe(true);
   });
 
   it("applies, reverts and re-applies the initial schema (reproducible)", async () => {
     const applied = await migrate(SHIPPED_MIGRATIONS);
-    expect(applied).toBe(3);
+    expect(applied).toBe(4);
     expect(await tableExists("nodes")).toBe(true);
     expect(await tableExists("clients")).toBe(true);
     expect(await tableExists("tunnel_secrets")).toBe(true);
@@ -61,11 +75,30 @@ describe("shipped migrations", () => {
     expect(await tableExists("routing_events")).toBe(true);
     expect(await tableExists("routing_policies")).toBe(true);
     expect(await tableExists("node_endpoints")).toBe(true);
+    // §38/§39/§40/§41 schema: client identity columns, domain results, firewall
+    // state and load-balancing tables.
+    expect(await tableExists("firewall_state")).toBe(true);
+    expect(await tableExists("firewall_applies")).toBe(true);
+    expect(await tableExists("lb_groups")).toBe(true);
+    expect(await tableExists("lb_members")).toBe(true);
+    expect(await columnExists("clients", "ovpn_username")).toBe(true);
+    expect(await columnExists("clients", "preferred_node_id")).toBe(true);
+    expect(await columnExists("inbounds", "domain_status")).toBe(true);
+    expect(await columnExists("nodes", "ssh_port")).toBe(true);
 
     // Re-running applies nothing: the runner is idempotent.
     expect(await migrate(SHIPPED_MIGRATIONS)).toBe(0);
 
     // Downgrade of the newest migration removes only its own objects.
+    expect(await migrateDown(SHIPPED_MIGRATIONS, { steps: 1 })).toEqual(["0004_full_management.sql"]);
+    expect(await tableExists("lb_groups")).toBe(false);
+    expect(await tableExists("firewall_applies")).toBe(false);
+    expect(await columnExists("clients", "ovpn_username")).toBe(false);
+    expect(await columnExists("inbounds", "domain_status")).toBe(false);
+    expect(await tableExists("clients")).toBe(true);
+    expect(await tableExists("path_health")).toBe(true);
+
+    // The routing migration reverts on its own after that.
     const routingReverted = await migrateDown(SHIPPED_MIGRATIONS, { steps: 1 });
     expect(routingReverted).toEqual(["0003_routing_intelligence.sql"]);
     expect(await tableExists("routing_policies")).toBe(false);
@@ -88,9 +121,11 @@ describe("shipped migrations", () => {
     expect((await migrationStatus(SHIPPED_MIGRATIONS))[0]!.appliedAt).toBeNull();
 
     // ...and the schema can be rebuilt exactly the same way.
-    expect(await migrate(SHIPPED_MIGRATIONS)).toBe(3);
+    expect(await migrate(SHIPPED_MIGRATIONS)).toBe(4);
     expect(await tableExists("nodes")).toBe(true);
     expect(await tableExists("routing_policies")).toBe(true);
+    expect(await tableExists("lb_members")).toBe(true);
+    expect(await columnExists("clients", "ovpn_username")).toBe(true);
   });
 
   it("refuses to revert a migration that has no reverse file", async () => {

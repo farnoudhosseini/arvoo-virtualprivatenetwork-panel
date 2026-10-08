@@ -112,6 +112,13 @@ export type TransportProtocol = "udp" | "tcp";
 export type InboundStatus = "draft" | "active" | "deploying" | "error" | "stopped";
 export type PerformanceProfile = "balanced" | "low-latency" | "throughput" | "compatibility";
 export type TlsMode = "tls-crypt" | "tls-auth" | "none";
+/**
+ * How a client proves who it is to OpenVPN:
+ *  * certificate          - client certificate only (historical default)
+ *  * password             - username + password only (certificate optional)
+ *  * certificate+password - both (certificate required, password verified)
+ */
+export type OpenVPNAuthMode = "certificate" | "password" | "certificate+password";
 
 export interface OpenVPNStructuredConfig {
   port: number;
@@ -147,7 +154,18 @@ export interface OpenVPNStructuredConfig {
   tunnelId: UUID | null;
   /** Egress node when traffic must exit through another node. */
   egressNodeId: UUID | null;
+  /**
+   * Optional public domain for this inbound (e.g. vpn.example.com). When it is
+   * set and resolves to the node's address, generated client profiles dial the
+   * domain instead of embedding the server address. The node's real address is
+   * always kept for health checks and deployment.
+   */
+  domain?: string | null;
+  /** Client authentication mode; absent means the historical certificate-only mode. */
+  authMode?: OpenVPNAuthMode;
 }
+
+export type InboundDomainStatus = "unset" | "verified" | "mismatch" | "unresolved";
 
 export interface InboundRecord {
   id: UUID;
@@ -156,6 +174,10 @@ export interface InboundRecord {
   protocol: VpnProtocol;
   nodeId: UUID;
   status: InboundStatus;
+  /** Result of the last DNS verification of `structuredConfig.domain`. */
+  domainStatus: InboundDomainStatus;
+  domainResolvedIps: string[];
+  domainCheckedAt: ISODate | null;
   structuredConfig: OpenVPNStructuredConfig;
   currentVersion: number;
   clientCount: number;
@@ -219,6 +241,21 @@ export interface ClientRecord {
   tags: string[];
   notes: string | null;
   limits: ClientLimits;
+  /**
+   * OpenVPN username. This is deliberately NOT the Arvoo panel account name and
+   * not the node identity: it only ever authenticates an OpenVPN tunnel.
+   */
+  ovpnUsername: string;
+  /** Whether username/password authentication is active for this client. */
+  ovpnAuthEnabled: boolean;
+  /** When the OpenVPN password was last changed. The password itself is never returned. */
+  ovpnPasswordSetAt: ISODate | null;
+  /** Placement/routing preferences consumed by the routing engine (spec §38). */
+  preferredNodeId: UUID | null;
+  preferredRegion: string | null;
+  preferredTransport: TransportProtocol | null;
+  fallbackInboundId: UUID | null;
+  routingPreferences: ClientRoutingPreferences;
   /** Base usage multiplier (1.0 = normal consumption). */
   baseMultiplier: number;
   /** Billed bytes (rx+tx multiplied by effective multiplier). */
@@ -230,6 +267,18 @@ export interface ClientRecord {
   usedTimeSec: number;
   createdAt: ISODate;
   updatedAt: ISODate;
+}
+
+/** Client-level placement preferences (spec §38), applied when sessions are placed. */
+export interface ClientRoutingPreferences {
+  /** Keep the client on the same healthy path for the whole session. */
+  sticky?: boolean;
+  /** Preferred exit (egress) node ids, in order of preference. */
+  preferExitNodeIds?: UUID[];
+  /** Node ids this client must never be placed on. */
+  excludeNodeIds?: UUID[];
+  /** Use the configured fallback inbound when the preferred one is unhealthy. */
+  failoverToFallback?: boolean;
 }
 
 export interface ClientDeviceRecord {
@@ -418,7 +467,8 @@ export type OperationType =
   | "CollectDiagnostics"
   | "TestTunnel"
   | "RunBenchmark"
-  | "SyncConfiguration";
+  | "SyncConfiguration"
+  | "ConfigureFirewall";
 
 export type OperationStatus =
   | "queued"
@@ -502,7 +552,22 @@ export type AuditAction =
   | "security.management_secret_rotate"
   | "security.management_secret_disable"
   | "security.management_secret_policy"
-  | "security.management_secret_previous_used";
+  | "security.management_secret_previous_used"
+  | "client.rename"
+  | "client.credentials"
+  | "client.placement"
+  | "client.inbounds"
+  | "inbound.domain"
+  | "lb.group_create"
+  | "lb.group_update"
+  | "lb.group_delete"
+  | "lb.member_update"
+  | "lb.drain"
+  | "lb.restore"
+  | "firewall.plan"
+  | "firewall.enable"
+  | "firewall.update"
+  | "firewall.disable";
 
 export interface AuditRecord {
   id: UUID;
@@ -656,6 +721,8 @@ export interface OpenVPNOpInput {
   inboundName: string;
   port: number;
   protocol: TransportProtocol;
+  /** Maximum concurrent clients this inbound accepts. */
+  maxClients?: number;
   configText: string;
   /** PKI material to write on the node (never stored in plaintext at rest here). */
   pki: {
@@ -667,6 +734,8 @@ export interface OpenVPNOpInput {
     dhParam: string | null;
   };
   clientNetwork: string;
+  /** Client authentication mode this configuration was generated for. */
+  authMode?: OpenVPNAuthMode;
   /** NAT/forwarding to apply when this inbound egresses via a tunnel. */
   egress?: {
     egressInterface: string | null;
@@ -674,6 +743,167 @@ export interface OpenVPNOpInput {
     forwardFromSubnet: string;
   } | null;
   clientConnectHook: string | null;
+}
+
+export type FirewallProtoName = "tcp" | "udp" | "gre" | "esp" | "icmp";
+
+/** Operator-controlled firewall inputs (stored with the other settings). */
+export interface FirewallPolicy {
+  /** SSH ports kept reachable on every host (default [22]). */
+  sshPorts: number[];
+  /** Addresses/CIDRs allowed to reach SSH; empty = any source. */
+  adminSources: string[];
+  /** Panel ports behind nginx on the master (default [80, 443]). */
+  panelPorts: number[];
+  /** Restrict the panel to adminSources as well (default false: VPN users need it). */
+  restrictPanel: boolean;
+  /** Expose the API port publicly (default false; the API stays on 127.0.0.1). */
+  exposeApiPort: boolean;
+  /** Allow ICMP echo (default true). */
+  allowIcmp: boolean;
+  /** Open ports for inbounds that are not active yet (default false). */
+  includeInactiveInbounds: boolean;
+  /** Additional operator-defined rules. */
+  extraRules: Array<{ port: number | null; proto: FirewallProtoName; from: string | null; comment: string }>;
+}
+
+export interface FirewallApplyRecord {
+  id: UUID;
+  nodeId: UUID;
+  at: ISODate;
+  requestedBy: string | null;
+  action: "enable" | "update" | "disable";
+  planHash: string;
+  status: "queued" | "running" | "success" | "failed";
+  rulesCount: number;
+  added: string[];
+  removed: string[];
+  operationId: UUID | null;
+  output: string | null;
+  error: string | null;
+  finishedAt: ISODate | null;
+}
+
+export interface FirewallNodeState {
+  nodeId: UUID;
+  enabled: boolean;
+  planHash: string | null;
+  rules: Array<{ id: string; origin: string; comment: string }>;
+  appliedAt: ISODate | null;
+  verifiedAt: ISODate | null;
+  detail: string | null;
+}
+
+/** Payload of the ConfigureFirewall node operation. */
+export interface FirewallOpInput {
+  nodeName: string;
+  action: "enable" | "update" | "disable";
+  /** The complete plan to apply (already computed by the control plane). */
+  plan: {
+    nodeName: string;
+    role: "master" | "node";
+    generatedAt: string;
+    defaultDenyIncoming: true;
+    rules: Array<{
+      id: string;
+      action: "allow";
+      proto: FirewallProtoName;
+      port: number | null;
+      from: string | null;
+      comment: string;
+      origin: string;
+    }>;
+    hash: string;
+  };
+  /** Rule ids previously applied on this node, so they can be withdrawn. */
+  previousRuleIds: string[];
+}
+
+export type LbMode = "weighted" | "failover" | "least-load";
+
+export interface LbHealthRequirements {
+  /** Minimum successful-probe ratio (%) over the recent window. */
+  minSuccessRatePct: number | null;
+  /** Maximum average RTT (ms) before a member counts as unhealthy. */
+  maxLatencyMs: number | null;
+  /** Maximum packet loss (%) before a member counts as unhealthy. */
+  maxLossPct: number | null;
+  /** Require the underlying node to be online. */
+  requireNodeOnline: boolean;
+}
+
+export interface LbFailoverPolicy {
+  /** Move new sessions to healthy members while one is unhealthy. */
+  redirectNewSessions: boolean;
+  /** Keep existing sessions where they are (never silently drop a tunnel). */
+  keepExistingSessions: boolean;
+  /** Automatically drain a member that stays unhealthy. */
+  autoDrain: boolean;
+  /** Automatically restore a drained member once it is healthy again. */
+  autoRestore: boolean;
+}
+
+export interface LbGroupRecord {
+  id: UUID;
+  name: string;
+  description: string | null;
+  enabled: boolean;
+  mode: LbMode;
+  healthRequirements: LbHealthRequirements;
+  failover: LbFailoverPolicy;
+  createdAt: ISODate;
+  updatedAt: ISODate;
+}
+
+export interface LbMemberRecord {
+  id: UUID;
+  groupId: UUID;
+  kind: "inbound" | "node";
+  refId: UUID;
+  weight: number;
+  priority: number;
+  enabled: boolean;
+  drained: boolean;
+  drainReason: string | null;
+}
+
+/** A member with its measured (never simulated) runtime state. */
+export interface LbMemberView extends LbMemberRecord {
+  name: string;
+  nodeId: UUID | null;
+  nodeName: string | null;
+  /** Health reasons are derived from real probes/telemetry; empty = healthy. */
+  healthy: boolean;
+  state: "healthy" | "degraded" | "unhealthy" | "drained" | "disabled" | "unknown";
+  reasons: string[];
+  latencyMs: number | null;
+  lossPct: number | null;
+  successRatePct: number | null;
+  checkedAt: ISODate | null;
+  activeSessions: number;
+  inboundStatus: string | null;
+  /** Share of the group's weight, as a real percentage of enabled+healthy weight. */
+  weightSharePct: number;
+}
+
+export interface LbGroupView extends LbGroupRecord {
+  members: LbMemberView[];
+  healthyMembers: number;
+  totalMembers: number;
+  activeSessions: number;
+  /** Billed traffic of the members' clients over the last rolling window. */
+  rxBytes: number;
+  txBytes: number;
+}
+
+export interface LbEventRecord {
+  id: UUID;
+  groupId: UUID;
+  at: ISODate;
+  kind: string;
+  memberId: UUID | null;
+  message: string;
+  detail: string | null;
 }
 
 export interface TunnelTestResult {

@@ -59,6 +59,9 @@ export async function executeOperation(op: AgentOperationPayload, ctx: OpContext
       case "ApplyFirewallPolicy":
         result = await ops.applyFirewallPolicy(input);
         break;
+      case "ConfigureFirewall":
+        result = await ops.configureFirewall(input);
+        break;
       case "InstallOpenVPN":
         result = await ops.installOpenVPN();
         break;

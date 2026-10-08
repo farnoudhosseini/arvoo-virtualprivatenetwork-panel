@@ -7,6 +7,7 @@
  */
 import { describe, expect, it } from "vitest";
 import { validateOperationInput } from "../src/validate-op.js";
+import { ufwStatusContains } from "../src/ufw.js";
 
 const validGre = {
   interfaceName: "gre-ir-01",
@@ -148,5 +149,102 @@ describe("validateOperationInput: malformed values are refused", () => {
     expect(validateOperationInput("CreateGRE", null)).toBeTruthy();
     expect(validateOperationInput("CreateGRE", ["nope"])).toBeTruthy();
     expect(validateOperationInput("SomethingElse", {})).toMatch(/unknown operation type/);
+  });
+});
+describe("ConfigureFirewall validation", () => {
+  const plan = (rules: unknown[]) => ({
+    nodeName: "ir-01",
+    role: "node",
+    generatedAt: new Date().toISOString(),
+    defaultDenyIncoming: true,
+    hash: "a1b2c3d4",
+    rules,
+  });
+  const rule = (over: Record<string, unknown> = {}) => ({
+    id: "tcp/22/any",
+    action: "allow",
+    proto: "tcp",
+    port: 22,
+    from: null,
+    comment: "Arvoo managed: SSH (any source)",
+    origin: "ssh",
+    ...over,
+  });
+
+  it("accepts a well-formed plan", () => {
+    expect(
+      validateOperationInput("ConfigureFirewall", { nodeName: "ir-01", action: "enable", plan: plan([rule()]), previousRuleIds: [] }),
+    ).toBeNull();
+  });
+
+  it("rejects an unknown protocol, a bad port and a non-allow action", () => {
+    expect(
+      validateOperationInput("ConfigureFirewall", { nodeName: "ir-01", action: "enable", plan: plan([rule({ proto: "sctp" })]) }),
+    ).toMatch(/proto/);
+    expect(
+      validateOperationInput("ConfigureFirewall", { nodeName: "ir-01", action: "enable", plan: plan([rule({ port: 0 })]) }),
+    ).toMatch(/port/);
+    expect(
+      validateOperationInput("ConfigureFirewall", { nodeName: "ir-01", action: "enable", plan: plan([rule({ action: "deny" })]) }),
+    ).toMatch(/action/);
+  });
+
+  it("rejects a source that is not an address, and a comment that could break out of the command", () => {
+    expect(
+      validateOperationInput("ConfigureFirewall", {
+        nodeName: "ir-01",
+        action: "enable",
+        plan: plan([rule({ from: "example.com" })]),
+      }),
+    ).toMatch(/IPv4/);
+    expect(
+      validateOperationInput("ConfigureFirewall", {
+        nodeName: "ir-01",
+        action: "enable",
+        plan: plan([rule({ comment: "x'; rm -rf / #" })]),
+      }),
+    ).toMatch(/comment/);
+  });
+
+  it("rejects an unknown action and an oversized rule set", () => {
+    expect(
+      validateOperationInput("ConfigureFirewall", { nodeName: "ir-01", action: "purge", plan: plan([]) }),
+    ).toMatch(/action/);
+    const many = Array.from({ length: 600 }, (_, i) => rule({ id: `tcp/${1000 + i}/any`, port: 1000 + i }));
+    expect(validateOperationInput("ConfigureFirewall", { nodeName: "ir-01", action: "enable", plan: plan(many) })).toMatch(
+      /at most/,
+    );
+  });
+});
+
+describe("ufw status verification", () => {
+  const status = [
+    "Status: active",
+    "",
+    "To                         Action      From",
+    "--                         ------      ----",
+    "22/tcp                     ALLOW       Anywhere",
+    "1194/udp                   ALLOW       Anywhere",
+    "500/udp                    ALLOW       198.51.100.20",
+    "47/gre                     ALLOW       198.51.100.20",
+    "ESP                        ALLOW       198.51.100.20",
+    "Anywhere                   ALLOW       198.51.100.20 on eth0",
+  ].join("\n");
+
+  const base = { action: "allow" as const, comment: "c", origin: "test" };
+
+  it("finds the rules that are really present", () => {
+    expect(ufwStatusContains(status, { ...base, id: "a", proto: "tcp", port: 22, from: null })).toBe(true);
+    expect(ufwStatusContains(status, { ...base, id: "b", proto: "udp", port: 1194, from: null })).toBe(true);
+    expect(ufwStatusContains(status, { ...base, id: "c", proto: "udp", port: 500, from: "198.51.100.20" })).toBe(true);
+    expect(ufwStatusContains(status, { ...base, id: "d", proto: "gre", port: null, from: "198.51.100.20" })).toBe(true);
+    expect(ufwStatusContains(status, { ...base, id: "e", proto: "esp", port: null, from: "198.51.100.20" })).toBe(true);
+  });
+
+  it("does not accept a rule from the wrong source, port or an inactive firewall", () => {
+    expect(ufwStatusContains(status, { ...base, id: "f", proto: "udp", port: 500, from: "203.0.113.1" })).toBe(false);
+    expect(ufwStatusContains(status, { ...base, id: "g", proto: "tcp", port: 8080, from: null })).toBe(false);
+    expect(ufwStatusContains("Status: inactive\n", { ...base, id: "h", proto: "tcp", port: 22, from: null })).toBe(false);
+    expect(ufwStatusContains("", { ...base, id: "i", proto: "tcp", port: 22, from: null })).toBe(false);
   });
 });

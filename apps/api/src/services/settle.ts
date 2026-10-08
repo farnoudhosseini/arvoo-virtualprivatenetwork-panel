@@ -3,6 +3,7 @@ import { completeOperation } from "./operations.js";
 import { onDeploymentOperationSettled, onEgressOperationSettled } from "./inbounds.js";
 import { onGreOperationSettled, recordTunnelTest } from "./tunnels.js";
 import { recordPathHealth } from "./routing.js";
+import { onFirewallOperationSettled } from "./firewall.js";
 
 /**
  * Single settlement entry point: marks the operation done and routes the
@@ -31,6 +32,11 @@ export async function settleOperation(
     case "CreateGRE":
       await onGreOperationSettled(operationId, success, payload.output, payload.error ?? null);
       break;
+    case "ConfigureFirewall": {
+      const result = (payload.output ?? {}) as { rules?: unknown; enabled?: boolean; verified?: boolean };
+      await onFirewallOperationSettled(operationId, success, result, payload.error ?? null);
+      break;
+    }
     case "TestTunnel": {
       const result = (payload.output ?? {}) as {
         ok?: boolean;

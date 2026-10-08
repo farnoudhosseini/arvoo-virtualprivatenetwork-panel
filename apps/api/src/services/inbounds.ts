@@ -1,18 +1,110 @@
+import crypto from "node:crypto";
+import { promises as dns } from "node:dns";
 import { q, q1, run, uuid, nowIso } from "../db/index.js";
-import type { OpenVPNStructuredConfig, InboundRecord } from "@arvoo/shared";
+import type { OpenVPNStructuredConfig, InboundRecord, OpenVPNAuthMode } from "@arvoo/shared";
 import {
   generateOpenVPNServerConfig,
   validateOpenVPNConfig,
   profileAdjustments,
+  normalizeAuthMode,
+  formatStaticKeyV1,
+  isStaticKeyV1,
 } from "@arvoo/shared";
 import { badRequest, conflict, notFound, unprocessable } from "../lib/errors.js";
-import { sha256, randomToken, encryptSecret } from "../lib/crypto.js";
+import { sha256, randomToken, encryptSecret, decryptSecret } from "../lib/crypto.js";
 import { ensureRootCA, issueServerCertificate, revokeCertificatesFor, serverMaterial } from "./pki.js";
 import { enqueueOperation, completeOperation, logOperation } from "./operations.js";
+
 import { raiseAlert } from "./alerts.js";
 import { audit } from "../lib/audit.js";
 
 type Row = Record<string, unknown>;
+
+function safeJson<T>(value: unknown, fallback: T): T {
+  if (typeof value !== "string" || value === "") return fallback;
+  try {
+    return JSON.parse(value) as T;
+  } catch {
+    return fallback;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Domain verification (spec §40)
+// ---------------------------------------------------------------------------
+
+export interface DomainCheckResult {
+  domain: string | null;
+  status: "unset" | "verified" | "mismatch" | "unresolved";
+  resolvedIps: string[];
+  expectedAddress: string | null;
+  checkedAt: string;
+  detail: string;
+}
+
+/** DNS lookup with a short timeout: a hanging resolver must not hang a request. */
+async function resolveHost(hostname: string, timeoutMs = 4000): Promise<string[]> {
+  const lookup = async (): Promise<string[]> => {
+    const [v4, v6] = await Promise.all([
+      dns.resolve4(hostname).catch(() => [] as string[]),
+      dns.resolve6(hostname).catch(() => [] as string[]),
+    ]);
+    return [...v4, ...v6];
+  };
+  return Promise.race([
+    lookup(),
+    new Promise<string[]>((resolve) => setTimeout(() => resolve([]), timeoutMs)),
+  ]);
+}
+
+/**
+ * Verify that an inbound's configured domain actually points at the node that
+ * serves it. The result is *stored* rather than assumed, so the panel can show
+ * what DNS said and when - and so an operator override is visible afterwards.
+ */
+export async function checkInboundDomain(inboundId: string): Promise<DomainCheckResult> {
+  const inbound = await getInbound(inboundId);
+  const node = await q1<{ address: string | null; name: string }>(`SELECT address, name FROM nodes WHERE id = ?`, inbound.nodeId);
+  const rawDomain = inbound.structuredConfig.domain;
+  const domain = typeof rawDomain === "string" && rawDomain.trim() !== "" ? rawDomain.trim().toLowerCase() : null;
+  const checkedAt = nowIso();
+
+  if (!domain) {
+    await run(
+      `UPDATE inbounds SET domain_status = 'unset', domain_resolved_ips = '[]', domain_checked_at = ? WHERE id = ?`,
+      checkedAt,
+      inboundId,
+    );
+    return { domain: null, status: "unset", resolvedIps: [], expectedAddress: node?.address ?? null, checkedAt, detail: "No domain configured" };
+  }
+
+  const resolved = await resolveHost(domain);
+  const expected = node?.address ?? null;
+  let status: DomainCheckResult["status"];
+  let detail: string;
+  if (resolved.length === 0) {
+    status = "unresolved";
+    detail = `${domain} does not resolve (A/AAAA). Clients dialing the domain would fail to connect.`;
+  } else if (!expected) {
+    status = "mismatch";
+    detail = `Node "${node?.name ?? "?"}" has no known address yet, so ${domain} cannot be compared`;
+  } else if (resolved.includes(expected)) {
+    status = "verified";
+    detail = `${domain} resolves to ${resolved.join(", ")}, which includes this node's address ${expected}`;
+  } else {
+    status = "mismatch";
+    detail = `${domain} resolves to ${resolved.join(", ")} but this node's address is ${expected}`;
+  }
+
+  await run(
+    `UPDATE inbounds SET domain_status = ?, domain_resolved_ips = ?, domain_checked_at = ? WHERE id = ?`,
+    status,
+    JSON.stringify(resolved),
+    checkedAt,
+    inboundId,
+  );
+  return { domain, status, resolvedIps: resolved, expectedAddress: expected, checkedAt, detail };
+}
 
 export async function rowToInbound(r: Row): Promise<InboundRecord> {
   return {
@@ -22,6 +114,10 @@ export async function rowToInbound(r: Row): Promise<InboundRecord> {
     protocol: r.protocol as InboundRecord["protocol"],
     nodeId: r.node_id as string,
     status: r.status as InboundRecord["status"],
+    /** Result of the last DNS check for the configured domain (spec §40). */
+    domainStatus: (r.domain_status as InboundRecord["domainStatus"]) ?? "unset",
+    domainResolvedIps: safeJson<string[]>(r.domain_resolved_ips, []),
+    domainCheckedAt: (r.domain_checked_at as string | null) ?? null,
     structuredConfig: JSON.parse(r.structured_config as string),
     currentVersion: r.current_version as number,
     clientCount:
@@ -117,6 +213,10 @@ async function fullConfig(input: Partial<OpenVPNStructuredConfig>, nodeId: strin
     port: await suggestPort(nodeId),
     listenAddress: "0.0.0.0",
     transport: "udp",
+    // New inbounds require the client certificate *and* a password: the profile
+    // ships the certificate inline, and the credential is issued in the panel.
+    authMode: "certificate+password",
+    domain: null,
     device: "tun",
     topology: "subnet",
     serverNetwork: await nextVpnSubnet(),
@@ -195,9 +295,11 @@ export async function createInbound(input: CreateInboundInput, actor: { id: stri
     now,
   );
 
-  // Server certificate + static TLS key
-  const issued = await issueServerCertificate(id, input.name);
-  const tlsKey = cfg.tlsMode === "none" ? null : randomToken(48);
+  // Server certificate + static TLS key. The certificate carries the
+  // configured domain in its SAN, so it stays valid when the profile dials the
+  // domain instead of the bare address.
+  const issued = await issueServerCertificate(id, input.name, cfg.domain ?? null);
+  const tlsKey = cfg.tlsMode === "none" ? null : formatStaticKeyV1(crypto.randomBytes(256));
   if (tlsKey) {
     await run(
       `INSERT INTO inbound_secrets (id, inbound_id, kind, data_encrypted, created_at) VALUES (?,?,?,?,?)`,
@@ -244,6 +346,12 @@ async function generateVersion(inboundId: string, cfg: OpenVPNStructuredConfig, 
 export async function updateInbound(id: string, patch: {
   description?: string | null;
   config?: Partial<OpenVPNStructuredConfig>;
+  /**
+   * Accept a domain whose DNS does not (yet) match this node - used for setups
+   * behind a proxy/NAT or for a name that is pointed at the node right after
+   * saving. The mismatch is recorded and shown, never hidden.
+   */
+  allowUnverifiedDomain?: boolean;
 }, actor: { id: string; name: string }): Promise<InboundRecord> {
   const inbound = await getInbound(id);
   const merged: OpenVPNStructuredConfig = { ...inbound.structuredConfig, ...(patch.config ?? {}) };
@@ -257,17 +365,173 @@ export async function updateInbound(id: string, patch: {
       validation,
     );
   }
-  const changed = JSON.stringify(merged) !== JSON.stringify(inbound.structuredConfig);
-  if (changed) {
+
+  // The domain is verified before the change is persisted to the generated
+  // configuration, so an unusable name cannot silently reach client profiles.
+  const domainChanged = (merged.domain ?? null) !== (inbound.structuredConfig.domain ?? null);
+  if (domainChanged) {
+    const previous = inbound.structuredConfig.domain ?? null;
     await run(
-      `UPDATE inbounds SET structured_config = ?, current_version = current_version + 1, updated_at = ? WHERE id = ?`,
+      `UPDATE inbounds SET structured_config = ?, updated_at = ? WHERE id = ?`,
       JSON.stringify(merged),
       nowIso(),
       id,
     );
-    await generateVersion(id, merged, actor);
+    const check = await checkInboundDomain(id);
+    if (check.status !== "verified" && check.status !== "unset" && !patch.allowUnverifiedDomain) {
+      // Roll the domain back and report exactly what DNS said: accepting it
+      // would hand clients a profile that cannot connect.
+      const reverted: OpenVPNStructuredConfig = { ...merged, domain: previous };
+      await run(
+        `UPDATE inbounds SET structured_config = ?, updated_at = ? WHERE id = ?`,
+        JSON.stringify(reverted),
+        nowIso(),
+        id,
+      );
+      throw unprocessable(
+        `Domain check failed for "${check.domain}": ${check.detail}. ` +
+          "Point the name at this node first, or save it anyway and fix DNS afterwards (the mismatch stays visible in the panel).",
+        check,
+      );
+    }
+  }
+  const effective = domainChanged ? merged : { ...inbound.structuredConfig, ...(patch.config ?? {}) };
+  const changed = JSON.stringify(effective) !== JSON.stringify(inbound.structuredConfig);
+  if (changed) {
+    await run(
+      `UPDATE inbounds SET structured_config = ?, current_version = current_version + 1, updated_at = ? WHERE id = ?`,
+      JSON.stringify(effective),
+      nowIso(),
+      id,
+    );
+    await generateVersion(id, effective, actor);
+  }
+
+  // Switching client authentication changes directives that only exist in the
+  // deployed server configuration (`verify-client-cert`, the
+  // `auth-user-pass-verify` hook). Re-applying it here is what makes the change
+  // real on the node instead of a database-only edit (spec §38 step 4).
+  const authModeChanged =
+    normalizeAuthMode(effective.authMode) !== normalizeAuthMode(inbound.structuredConfig.authMode);
+  const wasDeployed = inbound.status === "active" || inbound.status === "deploying";
+  if (authModeChanged && wasDeployed) {
+    const operationId = await applyInboundConfiguration(id, actor.name);
+    audit({
+      actorId: actor.id,
+      actorName: actor.name,
+      action: "inbound.update",
+      entityType: "inbound",
+      entityId: id,
+      entityName: inbound.name,
+      summary: operationId
+        ? `Authentication mode changed to ${normalizeAuthMode(effective.authMode)}; the inbound is being re-applied on the node`
+        : `Authentication mode changed to ${normalizeAuthMode(effective.authMode)}; the node agent is offline, so re-apply after it returns`,
+      detail: { operationId },
+    });
   }
   return getInbound(id);
+}
+
+/**
+ * Build the full node operation payload for an inbound: generated server
+ * configuration, PKI material, the static TLS key and - when the inbound uses
+ * password authentication - the bcrypt credential set the node verifies
+ * against.
+ *
+ * Shared by deployment and by credential synchronization so both paths push
+ * byte-identical configuration (spec §38: changes must reach the node, not just
+ * the database).
+ */
+export async function inboundOpInput(inboundId: string): Promise<Record<string, unknown> | null> {
+  const inbound = await getInbound(inboundId);
+  const material = await serverMaterial(inboundId).catch(() => null);
+  if (!material) return null;
+  const version = await inboundVersionConfig(inboundId, inbound.currentVersion);
+  if (!version) return null;
+  const cfg = inbound.structuredConfig;
+  const authMode = normalizeAuthMode(cfg.authMode);
+
+  let tlsKey: string | null = null;
+  const tlsKeyRow = await q1<{ id: string; data_encrypted: string }>(
+    `SELECT id, data_encrypted FROM inbound_secrets WHERE inbound_id = ? AND kind = 'tls_key'`,
+    inboundId,
+  );
+  if (tlsKeyRow) {
+    const stored = decryptSecret(tlsKeyRow.data_encrypted);
+    if (isStaticKeyV1(stored)) {
+      tlsKey = stored;
+    } else {
+      const regenerated = formatStaticKeyV1(crypto.randomBytes(256));
+      await run(
+        `UPDATE inbound_secrets SET data_encrypted = ?, created_at = ? WHERE id = ?`,
+        encryptSecret(regenerated),
+        nowIso(),
+        tlsKeyRow.id,
+      );
+      tlsKey = regenerated;
+      await raiseAlert({
+        severity: "warning",
+        type: "pki.tls_key_regenerated",
+        title: "Static TLS key regenerated",
+        message: `Inbound ${inbound.name} stored a tls-auth/tls-crypt key that OpenVPN would refuse. A new OpenVPN static key was generated; clients must download their profile again.`,
+        entityType: "inbound",
+        entityId: inboundId,
+      });
+    }
+  }
+
+  const egress =
+    cfg.deploymentMode === "through-tunnel" && cfg.tunnelId
+      ? await buildEgressContext(cfg.tunnelId, cfg.serverNetwork)
+      : null;
+
+  return {
+    inboundName: inbound.name,
+    port: cfg.port,
+    protocol: cfg.transport,
+    maxClients: cfg.maxClients,
+    configText: version.generatedConfig,
+    pki: {
+      ca: material.ca,
+      cert: material.cert,
+      key: material.key,
+      tlsKey,
+      tlsMode: cfg.tlsMode,
+      dhParam: null,
+    },
+    // The node receives the authentication *mode* (which determines the hooks
+    // in the server configuration) but never a credential: passwords are
+    // verified by the control plane on each connection (spec §39).
+    authMode,
+    clientNetwork: cfg.serverNetwork,
+    egress: egress?.ingressSide ?? null,
+  };
+}
+
+/**
+ * Re-apply an inbound's configuration on its node without creating a new
+ * version. Used when something outside the config text changed (credentials,
+ * hooks). Returns the operation id, or null when the node cannot take work
+ * right now - silently queueing for an offline node would look like success.
+ */
+export async function applyInboundConfiguration(inboundId: string, actorName: string): Promise<string | null> {
+  const inbound = await getInbound(inboundId);
+  const node = await q1<{ status: string; enrollment_state: string }>(
+    `SELECT status, enrollment_state FROM nodes WHERE id = ?`,
+    inbound.nodeId,
+  );
+  if (!node || node.enrollment_state !== "approved" || node.status !== "online") return null;
+  const input = await inboundOpInput(inboundId);
+  if (!input) return null;
+  const op = await enqueueOperation({
+    type: "UpdateOpenVPNInbound",
+    nodeId: inbound.nodeId,
+    refType: "inbound",
+    refId: inboundId,
+    requestedBy: actorName,
+    input,
+  });
+  return op.id;
 }
 
 /**
@@ -282,8 +546,7 @@ export async function deployInbound(id: string, actor: { id: string; name: strin
     inbound.nodeId,
   );
   if (!node) throw notFound("Node not found");
-  const version = await inboundVersionConfig(id, inbound.currentVersion);
-  if (!version) throw notFound("Inbound version missing");
+  if (!(await inboundVersionConfig(id, inbound.currentVersion))) throw notFound("Inbound version missing");
 
   if (node.enrollment_state !== "approved") {
     throw badRequest(
@@ -301,33 +564,34 @@ export async function deployInbound(id: string, actor: { id: string; name: strin
   }
 
   const cfg = inbound.structuredConfig;
-  const material = await serverMaterial(id);
-  const tlsKeyRow = await q1<{ data_encrypted: string }>(
-    `SELECT data_encrypted FROM inbound_secrets WHERE inbound_id = ? AND kind = 'tls_key'`,
-    id,
-  );
+
+  // Spec §40: never deploy a profile source whose name does not resolve. The
+  // check is refreshed here (not trusted from the last save), because DNS is
+  // exactly the part of a deployment that changes outside Arvoo.
+  const domain = typeof cfg.domain === "string" && cfg.domain.trim() !== "" ? cfg.domain.trim() : null;
+  if (domain) {
+    const lastCheck = inbound.domainCheckedAt ? new Date(inbound.domainCheckedAt).getTime() : 0;
+    const fresh = Date.now() - lastCheck < 10 * 60_000 && inbound.domainStatus !== "unresolved";
+    const check = fresh ? null : await checkInboundDomain(id);
+    if (check && check.status === "unresolved") {
+      throw badRequest(
+        `Refusing to deploy: ${check.detail}. Create the DNS record for ${domain} first (or clear the domain to dial the node address directly).`,
+      );
+    }
+  }
+
+  // One builder for the node payload: config text, PKI material, the static TLS
+  // key (regenerated if an older installation stored an unusable one) and the
+  // bcrypt credential set for inbounds that authenticate by password.
+  const opInput = await inboundOpInput(id);
+  if (!opInput) {
+    throw badRequest("PKI material or the current configuration version is missing for this inbound; re-issue the certificate first.");
+  }
 
   const egress =
     cfg.deploymentMode === "through-tunnel" && cfg.tunnelId
       ? await buildEgressContext(cfg.tunnelId, cfg.serverNetwork)
       : null;
-
-  const opInput = {
-    inboundName: inbound.name,
-    port: cfg.port,
-    protocol: cfg.transport,
-    configText: version.generatedConfig,
-    pki: {
-      ca: material.ca,
-      cert: material.cert,
-      key: material.key,
-      tlsKey: tlsKeyRow ? Buffer.from(tlsKeyRow.data_encrypted, "base64").toString("base64") : null,
-      tlsMode: cfg.tlsMode,
-      dhParam: null,
-    },
-    clientNetwork: cfg.serverNetwork,
-    egress: egress?.ingressSide ?? null,
-  };
 
   const op = await enqueueOperation({
     type: "CreateOpenVPNInbound",

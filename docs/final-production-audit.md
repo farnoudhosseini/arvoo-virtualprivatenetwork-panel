@@ -283,3 +283,67 @@ the language toggle) are the next steps. No speedup is claimed here.
 8. **Concurrency.** Approval, rotation and deployment paths are guarded and audited, but
    two administrators editing the same node or tunnel simultaneously can still produce a
    last-writer-wins outcome; optimistic concurrency on those forms is not implemented.
+
+---
+
+# Final completion pass (requirements §38–§50)
+
+This section records the last pass: full client editing, OpenVPN credentials, inbound
+domains, load balancing, dual-transport OpenVPN, the managed UFW buttons, the API
+reference and the release cleanup. The rule is unchanged from the sections above: a claim
+is only written here if it is backed by a test that ran or by an explicitly named gap.
+
+## 14. What was added
+
+| Requirement | Implementation |
+| --- | --- |
+| §38 Full client editing | [apps/web/src/pages/ClientDetail.tsx](../apps/web/src/pages/ClientDetail.tsx) now edits identity, limits, OpenVPN credentials, placement/routing and inbound assignment in place; [apps/api/src/services/clients.ts](../apps/api/src/services/clients.ts) validates, updates transactionally, bumps the inbound config version and re-applies it on the node. |
+| §39 OpenVPN username/password | Separate identity from the panel account and the node secret. The password is bcrypt-hashed, never returned and never logged; a password-authenticating inbound generates `auth-user-pass-verify` that asks `POST /agent/openvpn-auth` on every connection, so the node stores no credential. Rename reissues the certificate and disconnects sessions. |
+| §40 Inbound domain | Optional `domain` on every inbound, validated (RFC 1123, no IP literals), resolved on save/deploy and stored with its answer (`verified` / `mismatch` / `unresolved`); a mismatch must be forced explicitly and is never hidden. Generated `.ovpn` profiles dial the domain and fall back to the node address; the address stays authoritative for health checks and deployment, and goes into the certificate SAN. Editable after creation, with `GET /inbounds/:id/domain` and `POST /inbounds/:id/domain-check`. |
+| §41 Load balancing | New `lb_groups` / `lb_members` / `lb_events` tables (migration `0004_full_management`), [apps/api/src/services/loadbalancer.ts](../apps/api/src/services/loadbalancer.ts) and [apps/web/src/pages/LoadBalancing.tsx](../apps/web/src/pages/LoadBalancing.tsx). Health, latency, loss and session counts are read from recorded probes and the session table; an unprobed member is **unknown** with a reason, never healthy. Draining a node member also sets the node's administrative state, which is what the routing engine reads. |
+| §43 One-click installs | README documents both real raw-GitHub commands (`install.sh` with no arguments for the master, `--node --token <token>` for a node) and the checkout path. |
+| §44 API documentation | [docs/API.md](API.md) covers auth, RBAC, rate limits, every endpoint group, the error shape and a worked example; `GET /api/v1/system/routes` (admin) returns the live route inventory from the running Fastify instance so it can never list an endpoint that does not exist. |
+| §46 OpenVPN TCP + UDP | Inbound `transport` selects `proto udp` or `proto tcp-server` on the server and `proto udp` / `proto tcp-client` in generated profiles, with the MTU/MSS values appropriate to each; the transport is carried through deployment, health checks and generated configuration rather than being a dropdown. |
+| UFW buttons | **Config & Enable UFW** and **Update UFW** in [apps/web/src/pages/Firewall.tsx](../apps/web/src/pages/Firewall.tsx), backed by [apps/api/src/services/firewall.ts](../apps/api/src/services/firewall.ts), [apps/agent/src/ufw.ts](../apps/agent/src/ufw.ts) and the root helper [apps/agent/src/firewall-cli.ts](../apps/agent/src/firewall-cli.ts). The plan is derived from what actually exists (SSH ports, panel ports, every active inbound's port and transport, GRE/FOU/IPsec tunnel ports, loopback and established traffic) and applied by the host itself — the unprivileged API drops a request file into `/var/lib/arvoo/firewall-spool`, `deploy/arvoo-ufw-apply.path` starts `deploy/arvoo-ufw-apply.service`, and the helper writes back its real output. Update recomputes the plan and applies the difference (add and delete rules); `arvoo firewall status\|plan\|enable\|update\|disable` reuses the same code path. |
+
+## 15. Verification actually performed
+
+| Check | Command | Result |
+| --- | --- | --- |
+| Type check (all workspaces) | `npm run typecheck` | exit 0 |
+| Test suite | `npx vitest run` | 14 files, **249 tests passed**, exit 0 |
+| Migrations from scratch | `apps/api/test/migrations.test.ts` | applies, reverts and re-applies `0001`–`0004`; second run applies 0 |
+| Client editing / credentials / domain / LB / firewall API | `apps/api/test/api.test.ts` | covered, including refusal of an unresolvable domain, forced mismatch, credential change impact, drain/restore and management-gate enforcement |
+| Firewall planning | `packages/shared/src/firewall.test.ts` | plan contents, diff/apply, risky-input rejection |
+| Load-balancer selection | `packages/shared/src/lb.test.ts` | weighting, health gating, failover, drain |
+| Frontend production build | `cd apps/web && npx vite build` | exit 0, 2514 modules, 288 kB gzip |
+| Repository scan | `grep -rn "TODO\|FIXME\|mock\|placeholder"` | only HTML input placeholders and the SQL placeholder translator |
+
+## 16. Not verified here (requires Ubuntu 24.04)
+
+Honest list of what this Windows host cannot execute. Each item is a verification gap, not
+a known defect, and each has a corresponding command in §10/§49 above:
+
+1. Installer end to end, on a clean master and a clean node.
+2. `arvoo-ufw-apply` working through the systemd path unit, including the helper's real
+   `ufw` output and the panel reporting it.
+3. Real OpenVPN listeners (UDP and TCP), authentication over both transports, reconnect
+   behaviour and MTU/MSS on real packets.
+4. GRE links: interface, key, MTU, routes, return path, persistence across reboot.
+5. Node enrollment against a live control plane, revocation and credential rotation.
+6. certbot issuance/renewal, nginx reload, reboot persistence, backup and restore.
+
+## 17. Release state
+
+* Working tree is clean of generated databases (`apps/api/data`, `apps/data` were removed
+  from the index and are ignored), temporary snippet files, debug endpoints and test
+  credentials; `.gitignore` covers build output, local databases, environment files and
+  the root-only helper state.
+* No secret is committed: `/etc/arvoo.env` is generated by the installer, the example file
+  carries placeholders only, and certificate material is encrypted at rest with
+  `ARVOO_APP_SECRET`.
+* Both install commands in the README point at
+  `https://raw.githubusercontent.com/farnoudhosseini/arvoo-virtualprivatenetwork-panel/main/install.sh`,
+  which will resolve once the repository is pushed.
+* Remaining known limitations are the ones listed in §13 plus the six verification gaps in
+  §16. The product is not claimed to be verified on Linux until §16 runs.

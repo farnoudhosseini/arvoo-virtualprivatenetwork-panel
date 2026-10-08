@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { NavLink, Outlet, useNavigate } from "react-router-dom";
 import {
-  Activity, Boxes, ChevronLeft, Gauge, Globe, LayoutDashboard, LogOut, Menu, Moon, Network, Route,
-  ScrollText, Search, Server, Settings2, ShieldCheck, Sun, TriangleAlert, Users,
+  Activity, Boxes, ChevronLeft, Flame, Gauge, Globe, LayoutDashboard, LogOut, Menu, Moon, Network, Route,
+  Scale, ScrollText, Search, Server, Settings2, ShieldCheck, Sun, TriangleAlert, Users,
 } from "lucide-react";
 import { api } from "../../lib/api";
 import { timeAgo } from "../../lib/format";
@@ -65,6 +65,7 @@ const SECTIONS: SidebarSection[] = [
     items: [
       { to: "/inbounds", icon: <Globe size={15} />, label: "Inbounds" },
       { to: "/clients", icon: <Users size={15} />, label: "Clients" },
+      { to: "/load-balancing", icon: <Scale size={15} />, label: "Load balancing" },
       { to: "/policies", icon: <ShieldCheck size={15} />, label: "Policies" },
     ],
   },
@@ -86,7 +87,10 @@ const SECTIONS: SidebarSection[] = [
   },
   {
     label: "Administration",
-    items: [{ to: "/settings", icon: <Settings2 size={15} />, label: "Settings" }],
+    items: [
+      { to: "/firewall", icon: <Flame size={15} />, label: "Firewall" },
+      { to: "/settings", icon: <Settings2 size={15} />, label: "Settings" },
+    ],
   },
 ];
 

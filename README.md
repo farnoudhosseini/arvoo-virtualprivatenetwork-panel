@@ -71,10 +71,44 @@ the panel never reports success for work the node did not do.
 | Process manager | systemd (journald logging, restart policy, hardening) |
 | Backups | `pg_dump` to `/var/backups/arvoo` with retention + daily cron |
 
-## Production install (Ubuntu 24.04 LTS)
+## One-line install (Ubuntu 24.04 LTS)
+
+Official repository: <https://github.com/farnoudhosseini/arvoo-virtualprivatenetwork-panel>
+
+### Master + panel (complete stack)
 
 ```bash
-sudo git clone <your-repo-url> /opt/arvoo   # or copy this checkout to the host
+curl -fsSL https://raw.githubusercontent.com/farnoudhosseini/arvoo-virtualprivatenetwork-panel/main/install.sh | bash -s --
+```
+
+### Node only (enroll a VPN node)
+
+Generate an enrollment token in the panel (Nodes → Add node → enrollment token),
+then on the new Ubuntu 24.04 machine:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/farnoudhosseini/arvoo-virtualprivatenetwork-panel/main/install.sh | bash -s -- --node --token <ENROLLMENT_TOKEN>
+```
+
+Piping an installer into a root shell is convenient but opaque. If you prefer to
+read it first (recommended):
+
+```bash
+curl -fsSL -o arvoo-install.sh https://raw.githubusercontent.com/farnoudhosseini/arvoo-virtualprivatenetwork-panel/main/install.sh
+less arvoo-install.sh          # review
+sudo bash arvoo-install.sh     # or: sudo bash arvoo-install.sh --node --token <TOKEN>
+```
+
+The node-only path installs **no** PostgreSQL, **no** panel and **no** nginx: it
+installs the agent, enrolls the node with the one-time token, stores the node
+identity in `/etc/arvoo` (root only), verifies connectivity to the master and
+checks the Linux networking capabilities the node needs (IP forwarding, GRE,
+iptables, OpenVPN). It prints exactly what passed and what did not.
+
+## Production install (from a checkout)
+
+```bash
+sudo git clone https://github.com/farnoudhosseini/arvoo-virtualprivatenetwork-panel /opt/arvoo
 cd /opt/arvoo
 sudo ./install.sh                            # installs everything, idempotent
 ```
@@ -143,6 +177,101 @@ for `npm test`.
   `apps/api/src/migrations` (`NNNN_name.sql` + optional `NNNN_name.down.sql`),
   applied under an advisory lock at startup and by `install.sh`. Tables are
   never created by hand in the installer.
+
+## Managed firewall (UFW)
+
+The panel has a **Firewall** section with two actions per host:
+
+* **Config & Enable UFW** — builds a plan from the ports that actually exist on
+  that host (SSH, the panel behind nginx, **every deployed inbound's protocol and
+  port**, GRE protocol 47 and IPsec/FOU ports for every tunnel that terminates
+  there, optionally ICMP) and applies it with `ufw`;
+* **Update UFW** — recomputes the plan and applies the difference: ports that are
+  no longer needed are withdrawn, new ones are added. Rules you added by hand are
+  never touched, because Arvoo only withdraws the rule ids it applied itself.
+
+Nothing is assumed: after every apply the host's real `ufw status verbose` output
+is parsed, and a rule that ufw did not actually install is reported as a failure.
+The panel shows per host: active/inactive, in-sync/out-of-date, public ports, the
+last apply (who, when, result) and the warnings (for example "SSH is allowed from
+any address").
+
+How it runs without giving the panel privileges:
+
+* on a **node**, the change is a normal typed operation executed by the node agent
+  (whose sandbox is extended to `/etc/ufw` and `/var/lib/ufw`);
+* on the **panel host**, the unprivileged API writes the plan into
+  `/var/lib/arvoo/firewall-spool` and the systemd path unit
+  `arvoo-ufw-apply.path` runs `arvoo-ufw-apply.service`, a root oneshot unit that
+  applies it with `ufw` and writes the real result back for the panel to display.
+
+The same code path is available on the command line:
+
+```bash
+sudo arvoo firewall status                 # per-host state, ports and last apply
+sudo arvoo firewall plan                   # the exact ufw command lines
+sudo arvoo firewall enable                 # Config & Enable UFW on the panel host
+sudo arvoo firewall update                 # Update UFW after adding/removing an inbound
+sudo arvoo firewall enable --host <node-id> # target a node explicitly
+sudo arvoo firewall enable --local         # build the plan and apply it on this host directly
+```
+
+## Client management (full editing)
+
+Every meaningful property of a client is editable from the panel (Clients → a
+client → **Edit**), and every one of them has an API endpoint:
+
+| Property | Where |
+| --- | --- |
+| Client username (rename) | Edit → Details → Rename (reissues the certificate) |
+| Display name, description, notes, tags | `PATCH /api/v1/clients/:id` |
+| OpenVPN username and password | Edit → OpenVPN credentials → `PUT /api/v1/clients/:id/credentials` |
+| Expiry, start, traffic quota, time quota | `PATCH /api/v1/clients/:id` (`limits`) |
+| Device (HWID), IP and concurrent-session limits | `limits` |
+| Upload/download caps | `limits.downloadSpeedKbps` / `uploadSpeedKbps` |
+| Usage multiplier | `baseMultiplier` |
+| Assignments | `PUT /api/v1/clients/:id/inbounds` |
+| Preferred node / region / transport, fallback inbound | `POST /api/v1/clients/:id/placement` |
+| Routing preferences (sticky, fallback on failure, excluded nodes) | same endpoint |
+| Suspend / resume / revoke / certificate rotation | dedicated endpoints |
+
+**OpenVPN credentials are a separate identity.** They are not the Arvoo panel
+account and not the node secret. The password is stored as a bcrypt hash, never
+returned by any API response and never written to a log; an inbound that
+authenticates clients by password generates an `auth-user-pass-verify` hook that
+asks the control plane on every connection, so the node holds no credential and
+changing a password takes effect immediately (existing sessions of that client
+are disconnected, because they authenticated with the old value).
+
+## Inbound domains
+
+An OpenVPN inbound can carry a public domain (`vpn.example.com`). It is validated
+(RFC 1123 syntax, no IP literals), resolved at save/deploy time, and stored with
+the answer: `verified`, `mismatch` (resolves elsewhere) or `unresolved`. A name
+that does not resolve is refused unless you deliberately force it — a mismatch is
+never hidden, it stays on the inbound page with the resolved addresses. Generated
+`.ovpn` profiles dial the domain when it is set and fall back to the node address
+otherwise; the address remains authoritative for health checks and deployments,
+and the server certificate carries the domain in its SAN.
+
+## Load balancing
+
+A dedicated **Load balancing** section (not buried in node or client settings)
+provides groups of inbounds or nodes with:
+
+* weights and failover priority per member;
+* health requirements (minimum probe success rate, maximum latency, maximum loss,
+  node must be reporting);
+* enable / drain / restore per member and a failover policy (redirect new
+  sessions, keep existing ones, optional auto-drain/auto-restore);
+* a real "where would the next session go" decision and an event log.
+
+Every displayed value is measured: probe success rate, latency and loss come
+from the recorded path-health samples, session counts and traffic come from the
+session table. A member that was never probed is shown as **unknown** with the
+reason "No health probe has run for this member yet" — never as healthy. Draining
+a node member also sets that node's administrative state, which is what the
+routing engine reads, so the effect is real rather than a table flag.
 
 ## Security model
 

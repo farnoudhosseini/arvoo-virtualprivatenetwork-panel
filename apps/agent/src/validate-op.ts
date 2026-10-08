@@ -215,7 +215,14 @@ export function validateOperationInput(type: string, raw: unknown): string | nul
         checkName(input.inboundName, "inboundName") ??
         checkInt(input.port, "port", 1, 65535) ??
         (input.protocol === "udp" || input.protocol === "tcp" ? null : "protocol must be udp or tcp") ??
-        checkInt(input.maxClients, "maxClients", 1, 10000) ??
+        (input.maxClients === undefined || input.maxClients === null
+          ? null
+          : checkInt(input.maxClients, "maxClients", 1, 10000)) ??
+        (input.authMode === undefined || input.authMode === null
+          ? null
+          : input.authMode === "certificate" || input.authMode === "password" || input.authMode === "certificate+password"
+            ? null
+            : "authMode must be certificate, password or certificate+password") ??
         checkCidr(input.clientNetwork, "clientNetwork") ??
         checkStringWithin(input.configText, MAX_CONFIG_BYTES, "configText") ??
         checkPki(input.pki) ??
@@ -271,6 +278,8 @@ export function validateOperationInput(type: string, raw: unknown): string | nul
           : "masqueradeSourceNetworks must be an array")
       );
     }
+    case "ConfigureFirewall":
+      return checkFirewallOperation(input as Rec);
     case "InstallOpenVPN":
     case "CollectDiagnostics":
     case "SyncConfiguration":
@@ -278,6 +287,59 @@ export function validateOperationInput(type: string, raw: unknown): string | nul
     default:
       return `unknown operation type: ${type}`;
   }
+}
+
+/**
+ * Firewall payloads are the most dangerous thing the agent executes: they are
+ * turned into `ufw` command lines. Every rule is re-validated here - protocol
+ * whitelist, port range, IPv4/CIDR sources - so a compromised control plane
+ * cannot smuggle a shell metacharacter or an unexpected `ufw` argument in.
+ */
+const FIREWALL_PROTOS = new Set(["tcp", "udp", "gre", "esp", "icmp"]);
+const MAX_FIREWALL_RULES = 512;
+
+function checkFirewallOperation(input: Rec): string | null {
+  if (!isSafeName(input.nodeName, 63)) return "nodeName is not a valid host name";
+  if (input.action !== "enable" && input.action !== "update" && input.action !== "disable") {
+    return "action must be enable, update or disable";
+  }
+  const plan = asObject(input.plan);
+  if (!plan) return "plan must be an object";
+  if (!/^[0-9a-f]{1,16}$/.test(String(plan.hash))) return "plan.hash must be a hexadecimal digest";
+  if (plan.defaultDenyIncoming !== true) return "plan.defaultDenyIncoming must be true";
+  if (!Array.isArray(plan.rules)) return "plan.rules must be an array";
+  if (plan.rules.length > MAX_FIREWALL_RULES) return `plan.rules may contain at most ${MAX_FIREWALL_RULES} entries`;
+  for (const entry of plan.rules) {
+    const rule = asObject(entry);
+    if (!rule) return "each rule must be an object";
+    if (rule.action !== "allow") return "rules[].action must be allow";
+    if (typeof rule.proto !== "string" || !FIREWALL_PROTOS.has(rule.proto)) {
+      return "rules[].proto must be one of tcp, udp, gre, esp, icmp";
+    }
+    if (rule.proto === "tcp" || rule.proto === "udp") {
+      if (!isIntInRange(rule.port, 1, 65535)) return "rules[].port must be an integer between 1 and 65535";
+    } else if (rule.port !== null && rule.port !== undefined) {
+      return "rules[].port must be null for gre/esp/icmp";
+    }
+    if (rule.from !== null && rule.from !== undefined) {
+      if (typeof rule.from !== "string" || (!isIpv4(rule.from) && !isCidr(rule.from))) {
+        return "rules[].from must be an IPv4 address, CIDR or null";
+      }
+    }
+    if (typeof rule.comment !== "string" || rule.comment.length === 0 || rule.comment.length > 120) {
+      return "rules[].comment must be 1-120 characters";
+    }
+    if (/[\r\n'"]/.test(rule.comment)) return "rules[].comment may not contain quotes or newlines";
+    if (typeof rule.id !== "string" || rule.id.length === 0 || rule.id.length > 80) return "rules[].id is invalid";
+  }
+  const previous = input.previousRuleIds;
+  if (previous !== undefined && previous !== null) {
+    if (!Array.isArray(previous) || previous.length > MAX_FIREWALL_RULES) return "previousRuleIds must be an array";
+    if (previous.some((id) => typeof id !== "string" || id.length === 0 || id.length > 80)) {
+      return "previousRuleIds entries must be short strings";
+    }
+  }
+  return null;
 }
 
 function checkStringWithin(value: unknown, max: number, field: string): string | null {

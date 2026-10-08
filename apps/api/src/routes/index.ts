@@ -32,6 +32,9 @@ import { sha256 } from "../lib/crypto.js";
 import { randomBytes } from "node:crypto";
 import { SECURITY_HEADERS } from "../lib/security.js";
 import * as managementSecret from "../services/management-secret.js";
+import * as loadBalancer from "../services/loadbalancer.js";
+import * as firewallService from "../services/firewall.js";
+import { diffFirewallPlans, isValidDomain, normalizeAuthMode, ruleToUfwArgs, ufwDeleteArgs } from "@arvoo/shared";
 import { MANAGEMENT_SECRET_FILE } from "../services/management-secret.js";
 import { validateOpenVPNConfig } from "@arvoo/shared";
 import { config } from "../config.js";
@@ -560,6 +563,17 @@ export function registerRoutes(app: FastifyInstance): void {
     logVerbosity: z.number().int().min(0).max(11).optional(),
     deploymentMode: z.enum(["direct", "through-tunnel"]).optional(),
     tunnelId: z.string().uuid().nullable().optional(),
+    /** Optional public domain used in generated profiles (spec §40). */
+    domain: z
+      .string()
+      .max(253)
+      .nullable()
+      .optional()
+      .refine((v) => v == null || v === "" || isValidDomain(v), {
+        message: "domain must be a DNS name such as vpn.example.com",
+      }),
+    /** Client authentication mode (spec §39). */
+    authMode: z.enum(["certificate", "password", "certificate+password"]).optional(),
   });
 
   app.get("/api/v1/inbounds", async (request) => {
@@ -620,10 +634,54 @@ export function registerRoutes(app: FastifyInstance): void {
     const body = parse(z.object({
       description: z.string().max(2000).optional().nullable(),
       config: structuredConfigSchema.optional(),
+      allowUnverifiedDomain: z.boolean().optional(),
     }), request.body);
+    const domainChanged = body.config?.domain !== undefined;
     const inbound = await inboundsService.updateInbound(id, body, a);
-    audit({ actorId: a.id, actorName: a.name, action: "inbound.update", entityType: "inbound", entityId: id, entityName: inbound.name, summary: `Updated inbound ${inbound.name}` });
+    audit({
+      actorId: a.id,
+      actorName: a.name,
+      action: domainChanged ? "inbound.domain" : "inbound.update",
+      entityType: "inbound",
+      entityId: id,
+      entityName: inbound.name,
+      summary: domainChanged
+        ? `Set domain for ${inbound.name} to ${inbound.structuredConfig.domain ?? "(none)"} (DNS status: ${inbound.domainStatus})`
+        : `Updated inbound ${inbound.name}`,
+    });
     return { inbound };
+  });
+
+  // ---- Inbound domain verification (spec §40) ------------------------------ 
+  app.post("/api/v1/inbounds/:id/domain-check", async (request) => {
+    const a = actor(request, "operator");
+    const { id } = request.params as { id: string };
+    const result = await inboundsService.checkInboundDomain(id);
+    audit({
+      actorId: a.id,
+      actorName: a.name,
+      action: "inbound.domain",
+      entityType: "inbound",
+      entityId: id,
+      summary: `Domain check for ${result.domain ?? "(none)"}: ${result.status}`,
+      detail: { resolvedIps: result.resolvedIps, expectedAddress: result.expectedAddress },
+    });
+    return { check: result };
+  });
+
+  app.get("/api/v1/inbounds/:id/domain", async (request) => {
+    requireAuth(request);
+    const { id } = request.params as { id: string };
+    const inbound = await inboundsService.getInbound(id);
+    const node = await q1<{ address: string | null; name: string }>(`SELECT address, name FROM nodes WHERE id = ?`, inbound.nodeId);
+    return {
+      domain: inbound.structuredConfig.domain ?? null,
+      status: inbound.domainStatus,
+      resolvedIps: inbound.domainResolvedIps,
+      checkedAt: inbound.domainCheckedAt,
+      nodeAddress: node?.address ?? null,
+      nodeName: node?.name ?? null,
+    };
   });
 
   app.delete("/api/v1/inbounds/:id", async (request) => {
@@ -660,6 +718,28 @@ export function registerRoutes(app: FastifyInstance): void {
     const { id } = request.params as { id: string };
     await inboundsService.markInboundStopped(id, a);
     return { ok: true };
+  });
+
+  /** Load-balancing group fields, shared by create and update (spec §41). */
+  const lbHealthSchema = z.object({
+    minSuccessRatePct: z.number().min(0).max(100).nullable(),
+    maxLatencyMs: z.number().min(0).max(10000).nullable(),
+    maxLossPct: z.number().min(0).max(100).nullable(),
+    requireNodeOnline: z.boolean(),
+  });
+  const lbFailoverSchema = z.object({
+    redirectNewSessions: z.boolean(),
+    keepExistingSessions: z.boolean(),
+    autoDrain: z.boolean(),
+    autoRestore: z.boolean(),
+  });
+  const lbGroupSchema = z.object({
+    name: z.string().min(2).max(63),
+    description: z.string().max(1000).nullable().optional(),
+    mode: z.enum(["weighted", "failover", "least-load"]).optional(),
+    enabled: z.boolean().optional(),
+    healthRequirements: lbHealthSchema.partial().optional(),
+    failover: lbFailoverSchema.partial().optional(),
   });
 
   // ---- Clients ------------------------------------------------------------
@@ -710,6 +790,21 @@ export function registerRoutes(app: FastifyInstance): void {
       baseMultiplier: z.number().min(0.1).max(100).optional(),
       limits: limitsSchema.optional(),
       inboundIds: z.array(z.string().uuid()).max(50).optional(),
+      /** OpenVPN identity (spec §39). Defaults to the client name, no password. */
+      ovpnUsername: z.string().min(3).max(63).optional(),
+      ovpnPassword: z.string().min(10).max(128).optional(),
+      preferredNodeId: z.string().uuid().nullable().optional(),
+      preferredRegion: z.string().max(63).nullable().optional(),
+      preferredTransport: z.enum(["udp", "tcp"]).nullable().optional(),
+      fallbackInboundId: z.string().uuid().nullable().optional(),
+      routingPreferences: z
+        .object({
+          sticky: z.boolean().optional(),
+          preferExitNodeIds: z.array(z.string().uuid()).max(10).optional(),
+          excludeNodeIds: z.array(z.string().uuid()).max(20).optional(),
+          failoverToFallback: z.boolean().optional(),
+        })
+        .optional(),
     }), request.body);
     const client = await clientsService.createClient({
       username: body.username,
@@ -721,6 +816,13 @@ export function registerRoutes(app: FastifyInstance): void {
       baseMultiplier: body.baseMultiplier,
       limits: body.limits ?? {},
       inboundIds: body.inboundIds ?? [],
+      ovpnUsername: body.ovpnUsername ?? null,
+      ovpnPassword: body.ovpnPassword ?? null,
+      preferredNodeId: body.preferredNodeId ?? null,
+      preferredRegion: body.preferredRegion ?? null,
+      preferredTransport: body.preferredTransport ?? null,
+      fallbackInboundId: body.fallbackInboundId ?? null,
+      routingPreferences: body.routingPreferences,
     });
     audit({ actorId: a.id, actorName: a.name, action: "client.create", entityType: "client", entityId: client.id, entityName: client.username, summary: `Created client ${client.username}` });
     return { client };
@@ -744,6 +846,8 @@ export function registerRoutes(app: FastifyInstance): void {
     };
   });
 
+  // Every editable property except the identity ones (rename / credentials),
+  // which have their own audited endpoints below (spec §38).
   app.patch("/api/v1/clients/:id", async (request) => {
     const a = actor(request, "operator");
     const { id } = request.params as { id: string };
@@ -755,10 +859,142 @@ export function registerRoutes(app: FastifyInstance): void {
       tags: z.array(z.string().max(40)).max(16).optional(),
       baseMultiplier: z.number().min(0.1).max(100).optional(),
       limits: limitsSchema.optional(),
+      preferredNodeId: z.string().uuid().nullable().optional(),
+      preferredRegion: z.string().max(63).nullable().optional(),
+      preferredTransport: z.enum(["udp", "tcp"]).nullable().optional(),
+      fallbackInboundId: z.string().uuid().nullable().optional(),
+      routingPreferences: z
+        .object({
+          sticky: z.boolean().optional(),
+          preferExitNodeIds: z.array(z.string().uuid()).max(10).optional(),
+          excludeNodeIds: z.array(z.string().uuid()).max(20).optional(),
+          failoverToFallback: z.boolean().optional(),
+        })
+        .optional(),
+      ovpnAuthEnabled: z.boolean().optional(),
     }), request.body);
     const client = await clientsService.updateClient(id, body);
-    audit({ actorId: a.id, actorName: a.name, action: "client.update", entityType: "client", entityId: id, entityName: client.username, summary: `Updated client ${client.username}` });
+    audit({
+      actorId: a.id,
+      actorName: a.name,
+      action: "client.update",
+      entityType: "client",
+      entityId: id,
+      entityName: client.username,
+      summary: `Updated client ${client.username} (${Object.keys(body).join(", ") || "no fields"})`,
+    });
     return { client };
+  });
+
+  // ---- Client identity + OpenVPN credentials (spec §38/§39) ---------------
+  app.post("/api/v1/clients/:id/username", async (request) => {
+    const a = actor(request, "admin");
+    await requireManagement(request, `rename client ${(request.params as { id: string }).id}`);
+    const { id } = request.params as { id: string };
+    const body = parse(z.object({ username: z.string().min(3).max(63) }), request.body);
+    const before = await clientsService.getClient(id);
+    const client = await clientsService.renameClient(id, body.username);
+    audit({
+      actorId: a.id,
+      actorName: a.name,
+      action: "client.rename",
+      entityType: "client",
+      entityId: id,
+      entityName: client.username,
+      summary: `Renamed client ${before.username} to ${client.username}; certificate reissued, sessions disconnected`,
+    });
+    return { client };
+  });
+
+  app.put("/api/v1/clients/:id/credentials", async (request) => {
+    const a = actor(request, "admin");
+    await requireManagement(request, `change OpenVPN credentials for ${(request.params as { id: string }).id}`);
+    const { id } = request.params as { id: string };
+    const body = parse(z.object({
+      username: z.string().min(3).max(63).optional(),
+      password: z.string().min(10).max(128).optional(),
+      enabled: z.boolean().optional(),
+    }), request.body);
+    if (body.username === undefined && body.password === undefined && body.enabled === undefined) {
+      throw badRequest("Provide at least one of username, password or enabled");
+    }
+    const result = await clientsService.setOvpnCredentials(id, body, a.name);
+    audit({
+      actorId: a.id,
+      actorName: a.name,
+      action: "client.credentials",
+      entityType: "client",
+      entityId: id,
+      entityName: result.client.username,
+      summary:
+        `OpenVPN credentials for ${result.client.username}: ` +
+        [result.usernameChanged ? "username changed" : null, result.passwordChanged ? "password changed" : null]
+          .filter(Boolean)
+          .join(", ") || `credential settings updated`,
+      // Only metadata: the password itself is never logged or returned.
+      detail: { inboundsSynced: result.inboundsSynced, passwordSetAt: result.client.ovpnPasswordSetAt },
+    });
+    return { client: result.client, inboundsSynced: result.inboundsSynced };
+  });
+
+  app.get("/api/v1/clients/:id/credential-impact", async (request) => {
+    const a = actor(request, "operator");
+    const { id } = request.params as { id: string };
+    const inbounds = await clientsService.credentialInbounds(id);
+    audit({
+      actorId: a.id,
+      actorName: a.name,
+      action: "client.credentials",
+      entityType: "client",
+      entityId: id,
+      summary: `Credential impact check: ${inbounds.length} password-authenticating inbound(s) verify this client against the control plane`,
+      detail: { inbounds: inbounds.map((i) => i.name) },
+    });
+    return { inbounds, note: "Passwords are verified by the control plane on every connection; nothing is stored on the nodes." };
+  });
+
+  app.post("/api/v1/clients/:id/placement", async (request) => {
+    const a = actor(request, "operator");
+    const { id } = request.params as { id: string };
+    const body = parse(z.object({
+      preferredNodeId: z.string().uuid().nullable().optional(),
+      preferredRegion: z.string().max(63).nullable().optional(),
+      preferredTransport: z.enum(["udp", "tcp"]).nullable().optional(),
+      fallbackInboundId: z.string().uuid().nullable().optional(),
+      sticky: z.boolean().optional(),
+      preferExitNodeIds: z.array(z.string().uuid()).max(10).optional(),
+      excludeNodeIds: z.array(z.string().uuid()).max(20).optional(),
+      failoverToFallback: z.boolean().optional(),
+    }), request.body);
+    const client = await clientsService.updateClientPlacement(id, body);
+    audit({
+      actorId: a.id,
+      actorName: a.name,
+      action: "client.placement",
+      entityType: "client",
+      entityId: id,
+      entityName: client.username,
+      summary: `Updated placement for ${client.username}: node=${client.preferredNodeId ?? "any"}, region=${client.preferredRegion ?? "any"}, transport=${client.preferredTransport ?? "any"}`,
+    });
+    return { client };
+  });
+
+  app.put("/api/v1/clients/:id/inbounds", async (request) => {
+    const a = actor(request, "operator");
+    const { id } = request.params as { id: string };
+    const body = parse(z.object({ inboundIds: z.array(z.string().uuid()).max(50) }), request.body);
+    const assigned = await clientsService.setInboundAssignments(id, body.inboundIds, a.name);
+    const client = await clientsService.getClient(id);
+    audit({
+      actorId: a.id,
+      actorName: a.name,
+      action: "client.inbounds",
+      entityType: "client",
+      entityId: id,
+      entityName: client.username,
+      summary: `Set ${assigned.length} inbound assignment(s) for ${client.username}`,
+    });
+    return { client, inboundIds: assigned };
   });
 
   app.post("/api/v1/clients/:id/suspend", async (request) => {
@@ -1367,6 +1603,30 @@ export function registerRoutes(app: FastifyInstance): void {
     };
   });
 
+  /**
+   * Live route inventory, generated from the running Fastify instance rather
+   * than from a hand-written list, so it can never list an endpoint that does
+   * not exist. Paired with docs/API.md (request/response shapes, auth, RBAC and
+   * rate limits) this is the API reference: it is *not* a full OpenAPI schema,
+   * and the docs say so explicitly.
+   */
+  app.get("/api/v1/system/routes", async (request) => {
+    requireRole("admin")(request);
+    const tree = app.printRoutes({ commonPrefix: false });
+    const routes = tree
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0 && line !== "└── /" && line !== "├── /")
+      .map((line) => line.replace(/^[│├└─\s]+/, ""));
+    return {
+      service: "arvoo-control-plane",
+      generatedFrom: "fastify.printRoutes()",
+      documentation: "docs/API.md",
+      concurrency: { model: "request/response", websockets: false, polling: "clients poll /api/v1/... at their own interval" },
+      routes,
+    };
+  });
+
   app.post("/api/v1/maintenance/retention-sweep", async (request) => {
     actor(request, "admin");
     const healthDays = Number((await settingsService.getSetting("retention.healthDays")) ?? "14");
@@ -1375,6 +1635,259 @@ export function registerRoutes(app: FastifyInstance): void {
     const usageCutoff = new Date(Date.now() - usageDays * 86400_000).toISOString();
     await run(`DELETE FROM node_health_samples WHERE at < ?`, healthCutoff);
     await run(`DELETE FROM client_usage_samples WHERE at < ?`, usageCutoff);
-    return { ok: true, healthCutoff, usageCutoff };
+    // The same pass reconciles load-balancing groups against measured health and
+    // collects results produced by the master's privileged firewall helper.
+    const groups = await loadBalancer.reconcileGroups();
+    const firewallResults = await firewallService.ingestSelfResults();
+    return { ok: true, healthCutoff, usageCutoff, groups, firewallResults };
+  });
+
+  // ---- OpenVPN credential verification (spec §39) --------------------------
+  // Called by the node's `auth-user-pass-verify` hook. The node authenticates
+  // as itself; the *user's* password is verified here, so no credential is ever
+  // stored on the node.
+  app.post("/api/v1/agent/openvpn-auth", { config: { rateLimit: { max: 600, timeWindow: "1 minute" } } }, async (request) => {
+    const { nodeId } = await agentNode(request);
+    const body = parse(z.object({
+      username: z.string().min(1).max(128),
+      password: z.string().min(1).max(256),
+      commonName: z.string().max(255).nullable().optional(),
+      inboundName: z.string().min(1).max(63),
+    }), request.body);
+    const inbound = await q1<{ node_id: string; structured_config: string }>(
+      `SELECT node_id, structured_config FROM inbounds WHERE name = ?`,
+      body.inboundName,
+    );
+    if (!inbound || inbound.node_id !== nodeId) throw unauthorized("Inbound does not belong to this node");
+    let authMode = "certificate";
+    try {
+      authMode = normalizeAuthMode((JSON.parse(inbound.structured_config) as { authMode?: "certificate" | "password" | "certificate+password" }).authMode);
+    } catch {
+      authMode = "certificate";
+    }
+    if (authMode === "certificate") {
+      // Password authentication is not enabled on this inbound: refuse instead
+      // of silently accepting a credential the platform does not manage.
+      return { allow: false, reason: "This inbound authenticates by certificate only" };
+    }
+    const decision = await clientsService.authenticateOvpnCredentials({
+      username: body.username,
+      password: body.password,
+      commonName: body.commonName ?? null,
+      inboundName: body.inboundName,
+    });
+    if (!decision.allow) {
+      audit({
+        actorId: "system",
+        actorName: "openvpn-auth",
+        action: "auth.failed",
+        entityType: "client",
+        entityId: decision.clientId,
+        entityName: body.username,
+        summary: `OpenVPN login refused on ${body.inboundName}: ${decision.reason ?? "no reason"}`,
+        ip: request.ip,
+      });
+    }
+    // The reason is returned to the hook (which logs it for the operator) but
+    // never includes the password or the hash.
+    return { allow: decision.allow, reason: decision.reason };
+  });
+
+  // ---- Load balancing (spec §41) ------------------------------------------
+  app.get("/api/v1/lb/groups", async (request) => {
+    requireAuth(request);
+    return { groups: await loadBalancer.listGroupViews() };
+  });
+
+  app.post("/api/v1/lb/groups", async (request) => {
+    const a = actor(request, "operator");
+    const body = parse(lbGroupSchema, request.body);
+    const group = await loadBalancer.createGroup(body, a.name);
+    audit({ actorId: a.id, actorName: a.name, action: "lb.group_create", entityType: "settings", entityId: group.id, entityName: group.name, summary: `Created load-balancing group ${group.name} (${group.mode})` });
+    return { group: await loadBalancer.getGroupView(group.id) };
+  });
+
+  app.get("/api/v1/lb/groups/:id", async (request) => {
+    requireAuth(request);
+    const { id } = request.params as { id: string };
+    return { group: await loadBalancer.getGroupView(id) };
+  });
+
+  app.patch("/api/v1/lb/groups/:id", async (request) => {
+    const a = actor(request, "operator");
+    const { id } = request.params as { id: string };
+    const body = parse(lbGroupSchema.partial(), request.body);
+    const group = await loadBalancer.updateGroup(id, body, a.name);
+    audit({ actorId: a.id, actorName: a.name, action: "lb.group_update", entityType: "settings", entityId: id, entityName: group.name, summary: `Updated load-balancing group ${group.name}` });
+    return { group: await loadBalancer.getGroupView(id) };
+  });
+
+  app.delete("/api/v1/lb/groups/:id", async (request) => {
+    const a = actor(request, "operator");
+    const { id } = request.params as { id: string };
+    const group = await loadBalancer.getGroup(id);
+    await loadBalancer.deleteGroup(id);
+    audit({ actorId: a.id, actorName: a.name, action: "lb.group_delete", entityType: "settings", entityId: id, entityName: group.name, summary: `Deleted load-balancing group ${group.name}` });
+    return { ok: true };
+  });
+
+  app.post("/api/v1/lb/groups/:id/members", async (request) => {
+    const a = actor(request, "operator");
+    const { id } = request.params as { id: string };
+    const body = parse(z.object({
+      kind: z.enum(["inbound", "node"]),
+      refId: z.string().uuid(),
+      weight: z.number().int().min(0).max(1000).optional(),
+      priority: z.number().int().min(0).max(1000).optional(),
+      enabled: z.boolean().optional(),
+    }), request.body);
+    const member = await loadBalancer.addMember(id, body, a.name);
+    audit({ actorId: a.id, actorName: a.name, action: "lb.member_update", entityType: "settings", entityId: id, summary: `Added ${body.kind} member (weight ${member.weight}) to the group` });
+    return { group: await loadBalancer.getGroupView(id) };
+  });
+
+  app.patch("/api/v1/lb/members/:memberId", async (request) => {
+    const a = actor(request, "operator");
+    const { memberId } = request.params as { memberId: string };
+    const body = parse(z.object({
+      weight: z.number().int().min(0).max(1000).optional(),
+      priority: z.number().int().min(0).max(1000).optional(),
+      enabled: z.boolean().optional(),
+    }), request.body);
+    const member = await loadBalancer.updateMember(memberId, body, a.name);
+    audit({ actorId: a.id, actorName: a.name, action: "lb.member_update", entityType: "settings", entityId: member.groupId, summary: `Updated member: ${JSON.stringify(body)}` });
+    return { group: await loadBalancer.getGroupView(member.groupId) };
+  });
+
+  app.delete("/api/v1/lb/members/:memberId", async (request) => {
+    const a = actor(request, "operator");
+    const { memberId } = request.params as { memberId: string };
+    const member = await loadBalancer.getMember(memberId);
+    await loadBalancer.removeMember(memberId, a.name);
+    audit({ actorId: a.id, actorName: a.name, action: "lb.member_update", entityType: "settings", entityId: member.groupId, summary: `Removed a member from the group` });
+    return { group: await loadBalancer.getGroupView(member.groupId) };
+  });
+
+  app.post("/api/v1/lb/members/:memberId/drain", async (request) => {
+    const a = actor(request, "operator");
+    const { memberId } = request.params as { memberId: string };
+    const body = parse(z.object({ reason: z.string().max(500).nullable().optional() }), request.body ?? {});
+    const member = await loadBalancer.getMember(memberId);
+    await loadBalancer.drainMember(memberId, body.reason ?? null, a.name);
+    audit({ actorId: a.id, actorName: a.name, action: "lb.drain", entityType: "settings", entityId: member.groupId, summary: `Drained a member: ${body.reason ?? "no reason given"}` });
+    return { group: await loadBalancer.getGroupView(member.groupId) };
+  });
+
+  app.post("/api/v1/lb/members/:memberId/restore", async (request) => {
+    const a = actor(request, "operator");
+    const { memberId } = request.params as { memberId: string };
+    const member = await loadBalancer.getMember(memberId);
+    await loadBalancer.restoreMember(memberId, a.name);
+    audit({ actorId: a.id, actorName: a.name, action: "lb.restore", entityType: "settings", entityId: member.groupId, summary: "Restored a drained member" });
+    return { group: await loadBalancer.getGroupView(member.groupId) };
+  });
+
+  // Where the next session would go, computed from measured health. Never a
+  // simulated percentage: it either names a member or says why none is usable.
+  app.post("/api/v1/lb/groups/:id/choose", async (request) => {
+    requireAuth(request);
+    const { id } = request.params as { id: string };
+    const result = await loadBalancer.chooseForGroup(id);
+    return { memberId: result.member?.id ?? null, memberName: result.member?.name ?? null, degraded: result.degraded, reason: result.reason };
+  });
+
+  app.get("/api/v1/lb/groups/:id/events", async (request) => {
+    requireAuth(request);
+    const { id } = request.params as { id: string };
+    return { events: await loadBalancer.groupEvents(id) };
+  });
+
+  app.post("/api/v1/lb/reconcile", async (request) => {
+    const a = actor(request, "operator");
+    const result = await loadBalancer.reconcileGroups();
+    audit({ actorId: a.id, actorName: a.name, action: "lb.group_update", entityType: "settings", summary: `Load-balancing reconciliation: ${result.drained} drained, ${result.restored} restored` });
+    return result;
+  });
+
+  // ---- Managed firewall / UFW (spec §UFW) ---------------------------------
+  app.get("/api/v1/firewall", async (request) => {
+    requireAuth(request);
+    return firewallService.firewallOverview();
+  });
+
+  app.patch("/api/v1/firewall/policy", async (request) => {
+    const a = actor(request, "admin");
+    const body = parse(z.object({
+      sshPorts: z.array(z.number().int().min(1).max(65535)).min(1).max(4).optional(),
+      adminSources: z.array(z.string().max(63)).max(20).optional(),
+      panelPorts: z.array(z.number().int().min(1).max(65535)).max(4).optional(),
+      restrictPanel: z.boolean().optional(),
+      exposeApiPort: z.boolean().optional(),
+      allowIcmp: z.boolean().optional(),
+      includeInactiveInbounds: z.boolean().optional(),
+      extraRules: z
+        .array(
+          z.object({
+            port: z.number().int().min(1).max(65535).nullable(),
+            proto: z.enum(["tcp", "udp", "gre", "esp", "icmp"]),
+            from: z.string().max(63).nullable(),
+            comment: z.string().max(120),
+          }),
+        )
+        .max(50)
+        .optional(),
+    }), request.body);
+    const policy = await firewallService.saveFirewallPolicy(body);
+    audit({ actorId: a.id, actorName: a.name, action: "firewall.plan", entityType: "settings", summary: `Updated firewall policy: SSH ${policy.sshPorts.join(", ")}, panel ${policy.panelPorts.join(", ")}` });
+    return { policy };
+  });
+
+  // Preview of exactly what would be applied, with the ufw command lines.
+  app.get("/api/v1/firewall/plan", async (request) => {
+    requireAuth(request);
+    const query = request.query as { host?: string };
+    const plan = await firewallService.buildPlanForHost(query.host ?? firewallService.SELF_HOST);
+    const previous = await firewallService.appliedRules(query.host ?? firewallService.SELF_HOST);
+    const diff = diffFirewallPlans(previous, plan.rules);
+    return {
+      plan,
+      commands: plan.rules.map((rule) => ({ id: rule.id, argv: ruleToUfwArgs(rule), remove: ufwDeleteArgs(rule) })),
+      diff: { added: diff.added, removed: diff.removed, unchanged: diff.unchanged.length },
+    };
+  });
+
+  // "Config & Enable UFW": build the plan from real state and apply it.
+  app.post("/api/v1/firewall/apply", async (request) => {
+    const a = actor(request, "admin");
+    await requireManagement(request, "enable the managed firewall");
+    const body = parse(z.object({
+      host: z.string().min(1).max(64),
+      action: z.enum(["enable", "update", "disable"]).optional(),
+    }), request.body);
+    const action = body.action ?? "enable";
+    const result = await firewallService.requestApply(body.host, action, a.name);
+    audit({
+      actorId: a.id,
+      actorName: a.name,
+      action: action === "enable" ? "firewall.enable" : action === "update" ? "firewall.update" : "firewall.disable",
+      entityType: "settings",
+      entityId: result.hostKey,
+      summary:
+        `${action === "enable" ? "Config & Enable UFW" : action === "update" ? "Update UFW" : "Disable UFW"} on ${result.hostKey}: ` +
+        `${result.added.length} rule(s) added, ${result.removed.length} removed - ${result.status}`,
+      detail: { planHash: result.planHash, detail: result.detail, operationId: result.operationId },
+      ip: request.ip,
+    });
+    return result;
+  });
+
+  app.get("/api/v1/firewall/history", async (request) => {
+    requireAuth(request);
+    const query = request.query as { host?: string; limit?: string };
+    const limit = Math.min(Number(query.limit ?? 25), 100);
+    const rows = query.host
+      ? await q(`SELECT * FROM firewall_applies WHERE node_id = ? ORDER BY at DESC LIMIT ?`, query.host, limit)
+      : await q(`SELECT * FROM firewall_applies ORDER BY at DESC LIMIT ?`, limit);
+    return { applies: rows.map(firewallService.rowToApplyRecord) };
   });
 }

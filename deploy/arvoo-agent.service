@@ -58,8 +58,12 @@ PrivateDevices=true
 #   /etc/systemd/system arvoo-openvpn@<inbound>.service units
 #   /var/lib/arvoo      agent enrollment state
 #   /run                systemd/dbus sockets and runtime state
+#   /etc/ufw /var/lib/ufw  managed firewall (ufw rule files) when the panel's
+#                          "Config & Enable UFW"/"Update UFW" action targets
+#                          this node; rules the operator added by hand are never
+#                          touched (only the ids Arvoo applied are withdrawn).
 ProtectSystem=strict
-ReadWritePaths=/etc/arvoo /etc/systemd/system /var/lib/arvoo /run
+ReadWritePaths=/etc/arvoo /etc/systemd/system /var/lib/arvoo /run /etc/ufw /var/lib/ufw
 ProtectHome=true
 # Required for `sysctl -w net.ipv4.ip_forward=1`; the value is also applied
 # persistently at install time, so this is only a fallback path.

@@ -8,9 +8,10 @@
 #   * Reads secrets from /etc/arvoo.env (mode 0640, root:arvoo). The database
 #     password lives in the EnvironmentFile, never in this unit.
 #   * Listens on 127.0.0.1 only; Nginx is the only public entry point.
-#   * Writes nothing to disk: all state lives in PostgreSQL. ProtectSystem=strict
-#     therefore works without any ReadWritePaths exception (logs go to journald,
-#     the temporary directory is private and writable).
+#   * Writes almost nothing to disk: all state lives in PostgreSQL. The single
+#     exception is the firewall request spool (ReadWritePaths below): the panel
+#     may *ask* the root helper to apply a UFW plan, and that request is a file.
+#     The API itself can never execute ufw or any other privileged command.
 
 [Unit]
 Description=Arvoo Control Plane API (Fastify + PostgreSQL)
@@ -41,11 +42,12 @@ SyslogIdentifier=arvoo
 
 # ---- Hardening -------------------------------------------------------------
 # The API needs no privileges, no devices, no kernel access and no writable
-# filesystem beyond its private /tmp.
+# filesystem beyond its private /tmp plus the firewall request spool.
 NoNewPrivileges=true
 PrivateTmp=true
 PrivateDevices=true
 ProtectSystem=strict
+ReadWritePaths=/var/lib/arvoo/firewall-spool
 ProtectHome=true
 ProtectKernelTunables=true
 ProtectKernelModules=true

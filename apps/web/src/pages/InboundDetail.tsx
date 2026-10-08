@@ -6,7 +6,8 @@ import { Download, Globe, History, Play, RefreshCw, Rocket, RotateCcw, Server, S
 import { api } from "../lib/api";
 import type { InboundRecord } from "@arvoo/shared";
 import {
-  BackLink, Badge, Button, Card, CardHeader, EmptyState, ErrorState, KeyValue, LoadingState, PageHeader, UnifiedStatus, cx,
+  BackLink, Badge, Button, Card, CardHeader, EmptyState, ErrorState, Field, Input, KeyValue, LoadingState, PageHeader,
+  UnifiedStatus, cx,
 } from "../components/ui/primitives";
 import { CodeBlock, DataTable, StatCard } from "../components/ui/data";
 import { ConfirmDialog, Tabs } from "../components/ui/overlay";
@@ -91,6 +92,38 @@ export function InboundDetailPage() {
   const checksum = data.versions.find((v) => v.version === inbound.currentVersion)?.checksum ?? null;
   const lastDeploy = data.deployments[0];
 
+  /**
+   * Domain handling (spec §40): the domain is verified against DNS before it is
+   * accepted, and the panel always shows what DNS actually answered. Generated
+   * profiles dial the domain when it is set, and the node address otherwise.
+   */
+  const saveDomain = async (value: string | null, allowUnverified: boolean) => {
+    setBusy("domain");
+    try {
+      await api.patch(`/inbounds/${id}`, { config: { domain: value }, allowUnverifiedDomain: allowUnverified });
+      toast.success(value ? `Domain set to ${value}` : "Domain cleared; profiles use the node address");
+      void refetch();
+    } catch (err) {
+      toast.error((err as Error).message);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const checkDomain = async () => {
+    setBusy("domain-check");
+    try {
+      const res = await api.post<{ check: { status: string; detail: string } }>(`/inbounds/${id}/domain-check`);
+      const tone = res.check.status === "verified" ? toast.success : toast.error;
+      tone(res.check.detail);
+      void refetch();
+    } catch (err) {
+      toast.error((err as Error).message);
+    } finally {
+      setBusy(null);
+    }
+  };
+
   return (
     <div>
       <div className="mb-3">
@@ -151,6 +184,75 @@ export function InboundDetailPage() {
           sub={lastDeploy ? `${timeAgo(lastDeploy.created_at)} · v${lastDeploy.version}` : "deploy to push config"}
         />
       </div>
+
+      <Card className="mb-4">
+        <CardHeader
+          title="Public domain"
+          desc="Generated profiles dial this name when it is set and verified; the node address is used for health checks and deployment either way."
+          icon={<Globe size={14} />}
+          actions={
+            <Button size="sm" variant="secondary" onClick={checkDomain} loading={busy === "domain-check"}>
+              Check DNS now
+            </Button>
+          }
+        />
+        <div className="grid gap-3 px-4 py-3 sm:grid-cols-2">
+          <Field label="Domain" hint="Example: vpn.example.com — must resolve to this node's address">
+            <Input
+              defaultValue={cfg.domain ?? ""}
+              placeholder="vpn.example.com"
+              onKeyDown={(e) => {
+                if (e.key === "Enter") void saveDomain((e.target as HTMLInputElement).value.trim() || null, false);
+              }}
+              onBlur={(e) => {
+                const next = e.target.value.trim() || null;
+                if (next !== (cfg.domain ?? null)) void saveDomain(next, false);
+              }}
+            />
+          </Field>
+          <div className="space-y-2">
+            <KeyValue
+              label="DNS status"
+              value={
+                <span className="flex items-center gap-2">
+                  <Badge
+                    tone={
+                      inbound.domainStatus === "verified"
+                        ? "success"
+                        : inbound.domainStatus === "mismatch"
+                          ? "danger"
+                          : inbound.domainStatus === "unresolved"
+                            ? "warning"
+                            : "neutral"
+                    }
+                  >
+                    {inbound.domainStatus}
+                  </Badge>
+                  {inbound.domainResolvedIps.length > 0 && (
+                    <span className="mono text-2xs text-muted">{inbound.domainResolvedIps.join(", ")}</span>
+                  )}
+                </span>
+              }
+            />
+            <KeyValue label="Node address" value={node?.name ? `${node.name} (kept internally)` : "—"} />
+            <KeyValue
+              label="Last checked"
+              value={inbound.domainCheckedAt ? formatDateTime(inbound.domainCheckedAt) : "never"}
+            />
+            <Button
+              size="sm"
+              variant="ghost"
+              loading={busy === "domain"}
+              onClick={() => {
+                const value = (globalThis.prompt("Domain to force-save (the DNS mismatch stays visible)", cfg.domain ?? "") ?? "").trim();
+                if (value) void saveDomain(value, true);
+              }}
+            >
+              Force save a domain whose DNS does not match yet
+            </Button>
+          </div>
+        </div>
+      </Card>
 
       {node?.status !== "online" && (
         <div className="mb-4 rounded-default border border-warning/25 bg-warning-soft px-3.5 py-2.5 text-2xs leading-relaxed text-warning">

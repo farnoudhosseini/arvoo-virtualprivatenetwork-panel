@@ -9,8 +9,8 @@ import {
 import { api, downloadText } from "../lib/api";
 import type { ClientRecord } from "@arvoo/shared";
 import {
-  BackLink, Badge, Button, Card, CardHeader, EmptyState, ErrorState, Field, IconButton, Input, KeyValue, LoadingState,
-  Meter, PageHeader, UnifiedStatus, cx,
+  BackLink, Badge, Button, Card, CardHeader, Checkbox, EmptyState, ErrorState, Field, IconButton, Input, KeyValue,
+  LoadingState, Meter, PageHeader, Select, Switch, UnifiedStatus, cx,
 } from "../components/ui/primitives";
 import { CodeBlock, DataTable, StatCard } from "../components/ui/data";
 import { ConfirmDialog, Dialog, DialogContent, DropdownMenu, DropdownTrigger, DropdownContent, DropdownItem, DropdownSeparator, Tabs } from "../components/ui/overlay";
@@ -461,24 +461,110 @@ export function ClientDetailPage() {
 }
 
 function EditClientDialog({ open, onOpenChange, client, onSaved }: { open: boolean; onOpenChange: (v: boolean) => void; client: ClientRecord; onSaved: () => void }) {
+  const [tab, setTab] = useState("limits");
+  const [saving, setSaving] = useState(false);
+
+  // Details
+  const [displayName, setDisplayName] = useState(client.displayName ?? "");
+  const [description, setDescription] = useState(client.description ?? "");
+  const [notes, setNotes] = useState(client.notes ?? "");
+  const [multiplier, setMultiplier] = useState(String(client.baseMultiplier));
+
+  // Limits
   const [trafficGb, setTrafficGb] = useState(client.limits.trafficQuotaBytes != null ? String(Math.round(client.limits.trafficQuotaBytes / 1024 ** 3)) : "");
   const [deviceLimit, setDeviceLimit] = useState(client.limits.deviceLimit != null ? String(client.limits.deviceLimit) : "");
   const [ipLimit, setIpLimit] = useState(client.limits.ipLimit != null ? String(client.limits.ipLimit) : "");
-  const [multiplier, setMultiplier] = useState(String(client.baseMultiplier));
-  const [saving, setSaving] = useState(false);
+  const [sessions, setSessions] = useState(client.limits.concurrentSessions != null ? String(client.limits.concurrentSessions) : "");
+  const [download, setDownload] = useState(client.limits.downloadSpeedKbps != null ? String(client.limits.downloadSpeedKbps) : "");
+  const [upload, setUpload] = useState(client.limits.uploadSpeedKbps != null ? String(client.limits.uploadSpeedKbps) : "");
+  const [expiresAt, setExpiresAt] = useState(client.limits.expiresAt ? client.limits.expiresAt.slice(0, 16) : "");
 
-  const save = async () => {
+  // OpenVPN credentials (spec §39)
+  const [ovpnUsername, setOvpnUsername] = useState(client.ovpnUsername);
+  const [ovpnPassword, setOvpnPassword] = useState("");
+  const [ovpnEnabled, setOvpnEnabled] = useState(client.ovpnAuthEnabled);
+
+  // Placement (spec §38)
+  const [preferredNode, setPreferredNode] = useState(client.preferredNodeId ?? "");
+  const [preferredRegion, setPreferredRegion] = useState(client.preferredRegion ?? "");
+  const [preferredTransport, setPreferredTransport] = useState(client.preferredTransport ?? "");
+  const [fallbackInbound, setFallbackInbound] = useState(client.fallbackInboundId ?? "");
+  const [sticky, setSticky] = useState(client.routingPreferences.sticky ?? false);
+  const [failoverToFallback, setFailoverToFallback] = useState(client.routingPreferences.failoverToFallback ?? false);
+  const [assigned, setAssigned] = useState<string[]>([]);
+  const [assignedLoaded, setAssignedLoaded] = useState(false);
+
+  const { data: nodeOptions } = useQuery({
+    queryKey: ["nodes", "options"],
+    queryFn: () => api.get<{ nodes: Array<{ id: string; name: string; status: string }> }>("/nodes"),
+    enabled: open,
+  });
+  const { data: inboundOptions } = useQuery({
+    queryKey: ["inbounds", "options"],
+    queryFn: () => api.get<{ inbounds: Array<{ id: string; name: string; nodeId: string }> }>("/inbounds"),
+    enabled: open,
+  });
+  const { data: assignedNow } = useQuery({
+    queryKey: ["client", client.id, "inbounds"],
+    queryFn: () => api.get<{ inbounds: Array<{ id: string }> }>(`/clients/${client.id}`),
+    enabled: open,
+  });
+  if (open && !assignedLoaded && assignedNow) {
+    setAssigned(assignedNow.inbounds.map((i) => i.id));
+    setAssignedLoaded(true);
+  }
+
+  const num = (v: string) => (v.trim() === "" ? null : Number(v));
+
+  const saveDetails = async () => {
     setSaving(true);
     try {
       await api.patch(`/clients/${client.id}`, {
+        displayName: displayName || null,
+        description: description || null,
+        notes: notes || null,
         baseMultiplier: Number(multiplier) || 1,
+      });
+      toast.success("Client details saved");
+      onSaved();
+    } catch (err) {
+      toast.error((err as Error).message);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const saveLimits = async () => {
+    setSaving(true);
+    try {
+      await api.patch(`/clients/${client.id}`, {
         limits: {
           trafficQuotaBytes: trafficGb ? Number(trafficGb) * 1024 ** 3 : null,
-          deviceLimit: deviceLimit ? Number(deviceLimit) : null,
-          ipLimit: ipLimit ? Number(ipLimit) : null,
+          deviceLimit: num(deviceLimit),
+          ipLimit: num(ipLimit),
+          concurrentSessions: num(sessions),
+          downloadSpeedKbps: num(download),
+          uploadSpeedKbps: num(upload),
+          expiresAt: expiresAt ? new Date(expiresAt).toISOString() : null,
         },
       });
-      toast.success("Client limits updated");
+      toast.success("Limits updated");
+      onSaved();
+    } catch (err) {
+      toast.error((err as Error).message);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  /** Renaming reissues the certificate, so it asks for confirmation first. */
+  const renameClientAccount = async () => {
+    const next = window.prompt("New client username (the certificate is reissued and live sessions are disconnected)", client.username);
+    if (!next || next === client.username) return;
+    setSaving(true);
+    try {
+      await api.post(`/clients/${client.id}/username`, { username: next });
+      toast.success("Client renamed; certificate reissued");
       onSaved();
       onOpenChange(false);
     } catch (err) {
@@ -488,37 +574,254 @@ function EditClientDialog({ open, onOpenChange, client, onSaved }: { open: boole
     }
   };
 
+  const saveCredentials = async () => {
+    setSaving(true);
+    try {
+      const body: Record<string, unknown> = { enabled: ovpnEnabled };
+      if (ovpnUsername !== client.ovpnUsername) body.username = ovpnUsername;
+      if (ovpnPassword) body.password = ovpnPassword;
+      const res = await api.put<{ inboundsSynced: string[] }>(`/clients/${client.id}/credentials`, body);
+      toast.success(
+        ovpnPassword
+          ? `Password changed and live sessions disconnected. Inbounds verifying it: ${res.inboundsSynced.length}`
+          : "OpenVPN credential settings saved",
+      );
+      setOvpnPassword("");
+      onSaved();
+    } catch (err) {
+      toast.error((err as Error).message);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const savePlacement = async () => {
+    setSaving(true);
+    try {
+      await api.post(`/clients/${client.id}/placement`, {
+        preferredNodeId: preferredNode || null,
+        preferredRegion: preferredRegion || null,
+        preferredTransport: preferredTransport || null,
+        fallbackInboundId: fallbackInbound || null,
+        sticky,
+        failoverToFallback,
+      });
+      await api.put(`/clients/${client.id}/inbounds`, { inboundIds: assigned });
+      toast.success("Placement and inbound assignments saved");
+      onSaved();
+    } catch (err) {
+      toast.error((err as Error).message);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const toggleInbound = (id: string) =>
+    setAssigned((current) => (current.includes(id) ? current.filter((x) => x !== id) : [...current, id]));
+
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent
-        title={`Edit limits · ${client.username}`}
-        desc="Quota and policy changes are evaluated at the next connection check."
-        size="sm"
+        title={`Edit · ${client.username}`}
+        desc="Each section writes to the database and to the generated configuration; node-side changes are applied through real operations."
+        size="xl"
         footer={
           <>
             <Button variant="ghost" onClick={() => onOpenChange(false)}>
-              Cancel
+              Close
             </Button>
-            <Button variant="primary" onClick={save} loading={saving}>
-              Save changes
-            </Button>
+            {tab === "interface" && (
+              <Button variant="primary" onClick={saveDetails} loading={saving}>
+                Save details
+              </Button>
+            )}
+            {tab === "limits" && (
+              <Button variant="primary" onClick={saveLimits} loading={saving}>
+                Save limits
+              </Button>
+            )}
+            {tab === "credentials" && (
+              <Button variant="primary" onClick={saveCredentials} loading={saving}>
+                Save credentials
+              </Button>
+            )}
+            {tab === "placement" && (
+              <Button variant="primary" onClick={savePlacement} loading={saving}>
+                Save placement
+              </Button>
+            )}
           </>
         }
       >
-        <div className="grid gap-3 sm:grid-cols-2">
-          <Field label="Traffic quota (GB)" hint="Empty = unlimited">
-            <Input type="number" value={trafficGb} onChange={(e) => setTrafficGb(e.target.value)} />
-          </Field>
-          <Field label="Device limit">
-            <Input type="number" value={deviceLimit} onChange={(e) => setDeviceLimit(e.target.value)} />
-          </Field>
-          <Field label="IP limit">
-            <Input type="number" value={ipLimit} onChange={(e) => setIpLimit(e.target.value)} />
-          </Field>
-          <Field label="Base multiplier" hint="1.0 = normal billing">
-            <Input type="number" step="0.1" value={multiplier} onChange={(e) => setMultiplier(e.target.value)} />
-          </Field>
-        </div>
+        <Tabs
+          value={tab}
+          onValueChange={setTab}
+          variant="segmented"
+          items={[
+            {
+              value: "interface",
+              label: "Details",
+              content: (
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <Field label="Client username" hint="Renaming reissues the certificate">
+                    <div className="flex gap-2">
+                      <Input value={client.username} readOnly />
+                      <Button variant="secondary" onClick={renameClientAccount} disabled={saving}>
+                        Rename
+                      </Button>
+                    </div>
+                  </Field>
+                  <Field label="Display name">
+                    <Input value={displayName} onChange={(e) => setDisplayName(e.target.value)} />
+                  </Field>
+                  <Field label="Base multiplier" hint="1.0 = normal billing">
+                    <Input type="number" step="0.1" value={multiplier} onChange={(e) => setMultiplier(e.target.value)} />
+                  </Field>
+                  <Field label="Description">
+                    <Input value={description} onChange={(e) => setDescription(e.target.value)} />
+                  </Field>
+                  <Field label="Notes">
+                    <Input value={notes} onChange={(e) => setNotes(e.target.value)} />
+                  </Field>
+                </div>
+              ),
+            },
+            {
+              value: "limits",
+              label: "Limits",
+              content: (
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <Field label="Traffic quota (GB)" hint="Empty = unlimited">
+                    <Input type="number" value={trafficGb} onChange={(e) => setTrafficGb(e.target.value)} />
+                  </Field>
+                  <Field label="Expires at" hint="Local time; empty = never">
+                    <Input type="datetime-local" value={expiresAt} onChange={(e) => setExpiresAt(e.target.value)} />
+                  </Field>
+                  <Field label="Device (HWID) limit">
+                    <Input type="number" value={deviceLimit} onChange={(e) => setDeviceLimit(e.target.value)} />
+                  </Field>
+                  <Field label="IP limit">
+                    <Input type="number" value={ipLimit} onChange={(e) => setIpLimit(e.target.value)} />
+                  </Field>
+                  <Field label="Concurrent sessions">
+                    <Input type="number" value={sessions} onChange={(e) => setSessions(e.target.value)} />
+                  </Field>
+                  <Field label="Download limit (kbps)">
+                    <Input type="number" value={download} onChange={(e) => setDownload(e.target.value)} />
+                  </Field>
+                  <Field label="Upload limit (kbps)">
+                    <Input type="number" value={upload} onChange={(e) => setUpload(e.target.value)} />
+                  </Field>
+                </div>
+              ),
+            },
+            {
+              value: "credentials",
+              label: "OpenVPN credentials",
+              content: (
+                <div className="space-y-4">
+                  <p className="text-2xs leading-relaxed text-muted">
+                    These are the credentials a VPN user types into their client. They are not the Arvoo panel account and not a node
+                    identity. The password is stored as a bcrypt hash only, never returned, and is verified by the control plane on every
+                    connection - so changing it takes effect for the next connection and old sessions are dropped.
+                  </p>
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    <Field label="OpenVPN username">
+                      <Input value={ovpnUsername} onChange={(e) => setOvpnUsername(e.target.value)} />
+                    </Field>
+                    <Field label="New password" hint="Write-only; 10+ characters with a letter and a digit">
+                      <Input
+                        type="password"
+                        value={ovpnPassword}
+                        placeholder="Leave empty to keep the current password"
+                        onChange={(e) => setOvpnPassword(e.target.value)}
+                      />
+                    </Field>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <Switch checked={ovpnEnabled} onCheckedChange={setOvpnEnabled} label="Password authentication enabled" />
+                    <span className="text-xs text-muted">
+                      {ovpnEnabled ? "Password authentication enabled" : "Password authentication disabled (certificate only)"}
+                    </span>
+                  </div>
+                  <KeyValue
+                    label="Password last changed"
+                    value={client.ovpnPasswordSetAt ? formatDateTime(client.ovpnPasswordSetAt) : "Never set"}
+                  />
+                </div>
+              ),
+            },
+            {
+              value: "placement",
+              label: "Placement",
+              content: (
+                <div className="space-y-4">
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    <Field label="Preferred node" hint="Used when a new session is placed">
+                      <Select value={preferredNode} onChange={(e) => setPreferredNode(e.target.value)}>
+                        <option value="">Any node</option>
+                        {(nodeOptions?.nodes ?? []).map((n) => (
+                          <option key={n.id} value={n.id}>
+                            {n.name} ({n.status})
+                          </option>
+                        ))}
+                      </Select>
+                    </Field>
+                    <Field label="Preferred region" hint="Matched against the node region">
+                      <Input value={preferredRegion} onChange={(e) => setPreferredRegion(e.target.value)} />
+                    </Field>
+                    <Field label="Preferred transport">
+                      <Select value={preferredTransport} onChange={(e) => setPreferredTransport(e.target.value)}>
+                        <option value="">Any transport</option>
+                        <option value="udp">UDP</option>
+                        <option value="tcp">TCP</option>
+                      </Select>
+                    </Field>
+                    <Field label="Fallback inbound" hint="Must live on the preferred node">
+                      <Select value={fallbackInbound} onChange={(e) => setFallbackInbound(e.target.value)}>
+                        <option value="">No fallback</option>
+                        {(inboundOptions?.inbounds ?? [])
+                          .filter((i) => !preferredNode || i.nodeId === preferredNode)
+                          .map((i) => (
+                            <option key={i.id} value={i.id}>
+                              {i.name}
+                            </option>
+                          ))}
+                      </Select>
+                    </Field>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-4">
+                    <span className="flex items-center gap-2">
+                      <Switch checked={sticky} onCheckedChange={setSticky} label="Sticky sessions" />
+                      <span className="text-xs text-muted">Keep one path for the whole session</span>
+                    </span>
+                    <span className="flex items-center gap-2">
+                      <Switch checked={failoverToFallback} onCheckedChange={setFailoverToFallback} label="Use fallback on failure" />
+                      <span className="text-xs text-muted">Use the fallback inbound when the preferred one is unhealthy</span>
+                    </span>
+                  </div>
+                  <div>
+                    <div className="mb-2 text-2xs uppercase tracking-wide text-muted">
+                      Assigned inbounds{" "}
+                      {assigned.length === 0 ? "· none (this client may use any inbound)" : `· ${assigned.length} selected`}
+                    </div>
+                    <div className="grid gap-1.5 sm:grid-cols-2">
+                      {(inboundOptions?.inbounds ?? []).map((i) => (
+                        <label
+                          key={i.id}
+                          className="flex items-center gap-2 rounded-default border border-line bg-surface-2 px-2.5 py-1.5 text-xs"
+                        >
+                          <Checkbox checked={assigned.includes(i.id)} onCheckedChange={() => toggleInbound(i.id)} label={`Assign ${i.name}`} />
+                          <span className="flex-1 truncate text-text">{i.name}</span>
+                        </label>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              ),
+            },
+          ]}
+        />
       </DialogContent>
     </Dialog>
   );

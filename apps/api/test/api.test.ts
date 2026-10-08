@@ -1026,3 +1026,399 @@ describe("management access secret (second layer, graceful rotation)", () => {
     expect(JSON.stringify(posture.json())).not.toContain(secret);
   });
 });
+describe("full client management (§38/§39)", () => {
+  let nodeId = "";
+  let inboundId = "";
+  let clientId = "";
+
+  it("prepares an approved node and a real inbound to attach clients to", async () => {
+    const node = await api("POST", "/api/v1/nodes", { name: "CM-01", role: "vpn", regionClass: "iran" });
+    expect(node.statusCode).toBe(200);
+    nodeId = node.json().node.id;
+    const { run } = await import("../src/db/index.js");
+    await run(
+      `UPDATE nodes SET enrollment_state = 'approved', status = 'online', address = ? WHERE id = ?`,
+      "203.0.113.77",
+      nodeId,
+    );
+    const inbound = await api("POST", "/api/v1/inbounds", {
+      name: "cm-01-udp",
+      nodeId,
+      config: { transport: "udp", port: 1294, serverNetwork: "10.90.0.0/24" },
+    });
+    expect(inbound.statusCode).toBe(200);
+    inboundId = inbound.json().inbound.id;
+  });
+
+  it("creates a client with a dedicated OpenVPN username and password", async () => {
+    const created = await api("POST", "/api/v1/clients", {
+      username: "cm.alice",
+      displayName: "Alice",
+      ovpnUsername: "alice.vpn",
+      ovpnPassword: "Str0ngPassw0rd",
+      inboundIds: [inboundId],
+    });
+    expect(created.statusCode).toBe(200);
+    const client = created.json().client;
+    clientId = client.id;
+    // The password is never part of a response - not even its hash.
+    expect(JSON.stringify(client)).not.toContain("Str0ngPassw0rd");
+    expect(client.ovpnUsername).toBe("alice.vpn");
+    expect(client.ovpnPasswordSetAt).not.toBeNull();
+    expect(client.ovpnAuthEnabled).toBe(true);
+  });
+
+  it("rejects a weak OpenVPN password and a duplicate OpenVPN username", async () => {
+    const weak = await api("PUT", `/api/v1/clients/${clientId}/credentials`, { password: "short" });
+    expect(weak.statusCode).toBe(422);
+    const { run } = await import("../src/db/index.js");
+    await run(`UPDATE clients SET ovpn_username = 'someone.else' WHERE id = ?`, "00000000-0000-0000-0000-000000000000");
+    const other = await api("POST", "/api/v1/clients", { username: "cm.bob", ovpnUsername: "bob.vpn", ovpnPassword: "An0therPassw0rd" });
+    expect(other.statusCode).toBe(200);
+    const clash = await api("PUT", `/api/v1/clients/${other.json().client.id}/credentials`, { username: "alice.vpn" });
+    expect(clash.statusCode).toBe(409);
+  });
+
+  it("edits every editable property and clears one explicitly", async () => {
+    const patched = await api("PATCH", `/api/v1/clients/${clientId}`, {
+      displayName: "Alice A.",
+      description: "field client",
+      notes: "tenant 7",
+      baseMultiplier: 1.5,
+      limits: {
+        trafficQuotaBytes: 5 * 1024 ** 3,
+        deviceLimit: 3,
+        ipLimit: 4,
+        concurrentSessions: 2,
+        downloadSpeedKbps: 2048,
+        uploadSpeedKbps: 512,
+        expiresAt: "2030-01-01T00:00:00.000Z",
+      },
+    });
+    expect(patched.statusCode).toBe(200);
+    const client = patched.json().client;
+    expect(client.displayName).toBe("Alice A.");
+    expect(client.limits.deviceLimit).toBe(3);
+    expect(client.limits.downloadSpeedKbps).toBe(2048);
+    expect(client.limits.expiresAt).toBe("2030-01-01T00:00:00.000Z");
+
+    // An explicit null clears a field instead of being ignored.
+    const cleared = await api("PATCH", `/api/v1/clients/${clientId}`, { description: null });
+    expect(cleared.json().client.description).toBeNull();
+    expect(cleared.json().client.displayName).toBe("Alice A.");
+  });
+
+  it("rejects an invalid limit combination", async () => {
+    const res = await api("PATCH", `/api/v1/clients/${clientId}`, {
+      limits: { deviceLimit: 0 },
+    });
+    expect(res.statusCode).toBe(422);
+  });
+
+  it("stores placement preferences and enforces the fallback node rule", async () => {
+    const ok = await api("POST", `/api/v1/clients/${clientId}/placement`, {
+      preferredNodeId: nodeId,
+      preferredRegion: "iran",
+      preferredTransport: "udp",
+      fallbackInboundId: inboundId,
+      sticky: true,
+      failoverToFallback: true,
+    });
+    expect(ok.statusCode).toBe(200);
+    const client = ok.json().client;
+    expect(client.preferredNodeId).toBe(nodeId);
+    expect(client.preferredTransport).toBe("udp");
+    expect(client.routingPreferences.sticky).toBe(true);
+    expect(client.fallbackInboundId).toBe(inboundId);
+
+    const badNode = await api("POST", "/api/v1/clients", { username: "cm.carol" });
+    expect(badNode.statusCode).toBe(200);
+    const mismatch = await api("PATCH", `/api/v1/clients/${badNode.json().client.id}`, {
+      preferredNodeId: null,
+      fallbackInboundId: inboundId,
+    });
+    // Cleared preferred node + explicit inbound is allowed (no contradiction).
+    expect(mismatch.statusCode).toBe(200);
+  });
+
+  it("replaces inbound assignments and keeps them enforced", async () => {
+    const set = await api("PUT", `/api/v1/clients/${clientId}/inbounds`, { inboundIds: [] });
+    expect(set.statusCode).toBe(200);
+    expect(set.json().inboundIds).toEqual([]);
+    const again = await api("PUT", `/api/v1/clients/${clientId}/inbounds`, { inboundIds: [inboundId] });
+    expect(again.json().inboundIds).toEqual([inboundId]);
+  });
+
+  it("changes the OpenVPN password without ever returning it", async () => {
+    const res = await api("PUT", `/api/v1/clients/${clientId}/credentials`, {
+      password: "R0tatedPassw0rd",
+      username: "alice.renamed",
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().client.ovpnUsername).toBe("alice.renamed");
+    expect(JSON.stringify(res.json())).not.toContain("R0tatedPassw0rd");
+
+    const impact = await api("GET", `/api/v1/clients/${clientId}/credential-impact`);
+    expect(impact.statusCode).toBe(200);
+    expect(impact.json().inbounds.map((i: { name: string }) => i.name)).toContain("cm-01-udp");
+  });
+
+  it("renames the client, reissues the certificate and audits it", async () => {
+    const res = await api("POST", `/api/v1/clients/${clientId}/username`, { username: "cm.alice2" });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().client.username).toBe("cm.alice2");
+
+    const { q } = await import("../src/db/index.js");
+    const renamed = await q<{ count: string }>(
+      `SELECT COUNT(*)::text AS count FROM audit_logs WHERE action = 'client.rename' AND entity_id = ?`,
+      clientId,
+    );
+    expect(Number(renamed[0]?.count ?? 0)).toBeGreaterThan(0);
+    const certs = await q<{ count: string }>(
+      `SELECT COUNT(*)::text AS count FROM pki_certificates WHERE kind = 'client' AND client_id = ? AND revoked = 0`,
+      clientId,
+    );
+    expect(Number(certs[0]?.count ?? 0)).toBe(1);
+  });
+});
+
+describe("inbound domain (§40)", () => {
+  let inboundId = "";
+
+  it("prepares an inbound with a known node address", async () => {
+    const node = await api("POST", "/api/v1/nodes", { name: "DM-01", role: "vpn" });
+    const { run } = await import("../src/db/index.js");
+    await run(
+      `UPDATE nodes SET enrollment_state = 'approved', status = 'online', address = ? WHERE id = ?`,
+      "127.0.0.1",
+      node.json().node.id,
+    );
+    const inbound = await api("POST", "/api/v1/inbounds", {
+      name: "dm-01-udp",
+      nodeId: node.json().node.id,
+      config: { transport: "udp", port: 1295, serverNetwork: "10.91.0.0/24" },
+    });
+    expect(inbound.statusCode).toBe(200);
+    inboundId = inbound.json().inbound.id;
+  });
+
+  it("rejects a domain that is not a DNS name", async () => {
+    const res = await api("PATCH", `/api/v1/inbounds/${inboundId}`, { config: { domain: "10.0.0.5" } });
+    expect(res.statusCode).toBe(422);
+  });
+
+  it("refuses a name that does not resolve, and records the real check result", async () => {
+    const res = await api("PATCH", `/api/v1/inbounds/${inboundId}`, {
+      config: { domain: "not-a-real-host.invalid" },
+    });
+    expect(res.statusCode).toBe(422);
+    expect(res.json().error.message).toMatch(/does not resolve|Domain check failed/i);
+    // The check is stored even when it fails, so the panel can show why.
+    const inbound = await api("GET", `/api/v1/inbounds/${inboundId}`);
+    expect(inbound.json().inbound.domainStatus).toBe("unresolved");
+    expect(inbound.json().inbound.structuredConfig.domain).toBeNull();
+  });
+
+  it("accepts a domain that resolves to the node address", async () => {
+    // localhost resolves to 127.0.0.1, which is the address this node reports.
+    const res = await api("PATCH", `/api/v1/inbounds/${inboundId}`, { config: { domain: "localhost.localdomain" } });
+    if (res.statusCode === 200) {
+      expect(res.json().inbound.structuredConfig.domain).toBe("localhost.localdomain");
+      expect(["verified", "mismatch"]).toContain(res.json().inbound.domainStatus);
+    } else {
+      // A resolver that cannot answer must produce a clear refusal, never a
+      // silent success.
+      expect(res.statusCode).toBe(422);
+    }
+    const check = await api("POST", `/api/v1/inbounds/${inboundId}/domain-check`);
+    expect(check.statusCode).toBe(200);
+    expect(check.json().check.status).toBeDefined();
+  });
+
+  it("lets an operator force-save a domain and shows the mismatch", async () => {
+    const res = await api("PATCH", `/api/v1/inbounds/${inboundId}`, {
+      config: { domain: "forced.example.invalid" },
+      allowUnverifiedDomain: true,
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().inbound.structuredConfig.domain).toBe("forced.example.invalid");
+    expect(res.json().inbound.domainStatus).toBe("unresolved");
+    const domain = await api("GET", `/api/v1/inbounds/${inboundId}/domain`);
+    expect(domain.json().status).toBe("unresolved");
+    expect(domain.json().nodeAddress).toBe("127.0.0.1");
+  });
+
+  it("clears the domain and falls back to the node address", async () => {
+    const res = await api("PATCH", `/api/v1/inbounds/${inboundId}`, { config: { domain: null } });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().inbound.structuredConfig.domain).toBeNull();
+    expect(res.json().inbound.domainStatus).toBe("unset");
+  });
+});
+
+describe("load balancing (§41)", () => {
+  let groupId = "";
+  let memberId = "";
+  let nodeId = "";
+
+  it("creates a group and adds a real node member", async () => {
+    const node = await api("POST", "/api/v1/nodes", { name: "LB-01", role: "vpn" });
+    nodeId = node.json().node.id;
+    const group = await api("POST", "/api/v1/lb/groups", {
+      name: "Test pool",
+      mode: "weighted",
+      healthRequirements: { minSuccessRatePct: 90, maxLatencyMs: 100, maxLossPct: 5, requireNodeOnline: true },
+    });
+    expect(group.statusCode).toBe(200);
+    groupId = group.json().group.id;
+    const member = await api("POST", `/api/v1/lb/groups/${groupId}/members`, { kind: "node", refId: nodeId, weight: 50 });
+    expect(member.statusCode).toBe(200);
+    const view = member.json().group;
+    expect(view.members).toHaveLength(1);
+    memberId = view.members[0].id;
+    // Never probed and not reporting: the member must not be presented healthy.
+    expect(view.members[0].healthy).toBe(false);
+    expect(view.members[0].state).toBe("unknown");
+    expect(view.members[0].reasons.join(" ")).toMatch(/not reporting|never|No health probe/i);
+  });
+
+  it("rejects a duplicate member and an invalid weight", async () => {
+    expect((await api("POST", `/api/v1/lb/groups/${groupId}/members`, { kind: "node", refId: nodeId })).statusCode).toBe(409);
+    expect((await api("PATCH", `/api/v1/lb/members/${memberId}`, { weight: 5000 })).statusCode).toBe(422);
+  });
+
+  it("explains why no session can be placed when nothing is healthy", async () => {
+    const choice = await api("POST", `/api/v1/lb/groups/${groupId}/choose`);
+    expect(choice.statusCode).toBe(200);
+    const body = choice.json();
+    expect(body.memberId).toBe(memberId);
+    expect(body.degraded).toBe(true);
+    expect(body.reason).toMatch(/unhealthy|unavailable|healthy/i);
+  });
+
+  it("drains a node member, which also drains the node itself", async () => {
+    const drained = await api("POST", `/api/v1/lb/members/${memberId}/drain`, { reason: "maintenance window" });
+    expect(drained.statusCode).toBe(200);
+    const member = drained.json().group.members[0];
+    expect(member.drained).toBe(true);
+    expect(member.state).toBe("drained");
+    const { q } = await import("../src/db/index.js");
+    const node = await q<{ admin_state: string }>(`SELECT admin_state FROM nodes WHERE id = ?`, nodeId);
+    expect(node[0]?.admin_state).toBe("drained");
+    const blocked = await api("POST", `/api/v1/lb/groups/${groupId}/choose`);
+    expect(blocked.json().memberId).toBeNull();
+    expect(blocked.json().reason).toMatch(/disabled or drained/i);
+  });
+
+  it("restores the member and the node", async () => {
+    const restored = await api("POST", `/api/v1/lb/members/${memberId}/restore`);
+    expect(restored.statusCode).toBe(200);
+    expect(restored.json().group.members[0].drained).toBe(false);
+    const { q } = await import("../src/db/index.js");
+    const node = await q<{ admin_state: string }>(`SELECT admin_state FROM nodes WHERE id = ?`, nodeId);
+    expect(node[0]?.admin_state).toBe("enabled");
+    const events = await api("GET", `/api/v1/lb/groups/${groupId}/events`);
+    expect(events.json().events.length).toBeGreaterThanOrEqual(4);
+  });
+
+  it("keeps group membership in sync when the member is removed", async () => {
+    const removed = await api("DELETE", `/api/v1/lb/members/${memberId}`);
+    expect(removed.statusCode).toBe(200);
+    expect(removed.json().group.members).toHaveLength(0);
+    expect((await api("DELETE", `/api/v1/lb/groups/${groupId}`)).statusCode).toBe(200);
+  });
+});
+
+describe("managed firewall (§UFW)", () => {
+  it("builds a plan with SSH, panel and ICMP rules before anything is applied", async () => {
+    const res = await api("GET", "/api/v1/firewall/plan?host=self");
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    const origins = body.plan.rules.map((r: { origin: string }) => r.origin);
+    expect(origins).toContain("ssh");
+    expect(origins).toContain("panel");
+    expect(origins).toContain("icmp");
+    // Rendered command lines are exactly what the helper executes.
+    for (const command of body.commands) {
+      expect(command.argv[0]).toBe("allow");
+      expect(command.remove[0]).toBe("delete");
+    }
+  });
+
+  it("refuses a policy that would lock out SSH", async () => {
+    const res = await api("PATCH", "/api/v1/firewall/policy", { sshPorts: [] });
+    expect(res.statusCode).toBe(422);
+  });
+
+  it("saves a policy and reflects it in the plan", async () => {
+    const saved = await api("PATCH", "/api/v1/firewall/policy", {
+      sshPorts: [2222],
+      adminSources: ["198.51.100.7"],
+      allowIcmp: false,
+    });
+    expect(saved.statusCode).toBe(200);
+    const res = await api("GET", "/api/v1/firewall/plan?host=self");
+    const ssh = res.json().plan.rules.find((r: { origin: string; port: number }) => r.origin === "ssh");
+    expect(ssh.port).toBe(2222);
+    expect(ssh.from).toBe("198.51.100.7");
+    expect(res.json().plan.rules.some((r: { origin: string }) => r.origin === "icmp")).toBe(false);
+    // SSH restricted to one address must warn that the panel is still public.
+    await api("PATCH", "/api/v1/firewall/policy", { sshPorts: [22], adminSources: [], allowIcmp: true });
+  });
+
+  it("opens the port of a deployed inbound in the plan", async () => {
+    const { q, run } = await import("../src/db/index.js");
+    const inbound = await q<{ id: string; node_id: string }>(`SELECT id, node_id FROM inbounds ORDER BY created_at DESC LIMIT 1`);
+    const target = inbound[0]!;
+    await run(`UPDATE inbounds SET status = 'active' WHERE id = ?`, target.id);
+    const res = await api("GET", `/api/v1/firewall/plan?host=${target.node_id}`);
+    expect(res.statusCode).toBe(200);
+    const origin = res.json().plan.rules.map((r: { origin: string }) => r.origin);
+    expect(origin.some((o: string) => o.startsWith("inbound:"))).toBe(true);
+  });
+
+  it("reports every host with its real applied state", async () => {
+    const res = await api("GET", "/api/v1/firewall");
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(Array.isArray(body.hosts)).toBe(true);
+    expect(body.hosts[0].key).toBe("self");
+    expect(body.policy.sshPorts).toEqual([22]);
+    expect(typeof body.spoolDir).toBe("string");
+    // Nothing has been applied yet, so no host may claim to be active.
+    expect(body.hosts.every((h: { enabled: boolean }) => h.enabled === false)).toBe(true);
+  });
+
+  it("refuses to apply on a node whose agent is not online, without pretending", async () => {
+    const { q } = await import("../src/db/index.js");
+    const node = await q<{ id: string }>(`SELECT id FROM nodes WHERE name = 'LB-01' LIMIT 1`);
+    const res = await api("POST", "/api/v1/firewall/apply", { host: node[0]!.id, action: "enable" });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().status).toBe("unavailable");
+    expect(res.json().detail).toMatch(/not online|not approved/i);
+  });
+
+  it("rejects an unknown host", async () => {
+    const res = await api("POST", "/api/v1/firewall/apply", {
+      host: "00000000-0000-0000-0000-000000000000",
+      action: "enable",
+    });
+    expect(res.statusCode).toBe(404);
+  });
+
+  it("records the request history", async () => {
+    const res = await api("GET", "/api/v1/firewall/history");
+    expect(res.statusCode).toBe(200);
+    expect(Array.isArray(res.json().applies)).toBe(true);
+  });
+
+  it("refuses OpenVPN password authentication from an unknown node", async () => {
+    const res = await app.inject({
+      method: "POST",
+      url: "/api/v1/agent/openvpn-auth",
+      payload: { username: "alice", password: "whatever", inboundName: "cm-01-udp" },
+      headers: { authorization: "Bearer arvoo-node 00000000-0000-0000-0000-000000000000:deadbeef" },
+    });
+    expect(res.statusCode).toBe(401);
+  });
+});

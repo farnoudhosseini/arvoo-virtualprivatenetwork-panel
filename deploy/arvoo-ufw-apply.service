@@ -1,0 +1,47 @@
+# Arvoo managed-firewall helper (master host).
+#
+# The Arvoo control plane runs as the unprivileged `arvoo` user and is forbidden
+# from executing privileged commands. When the panel's "Config & Enable UFW" /
+# "Update UFW" action targets the *panel host itself*, the API writes a request
+# (the exact ufw rule set it computed) into /var/lib/arvoo/firewall-spool and
+# this oneshot unit - triggered by arvoo-ufw-apply.path - applies it with ufw.
+# The real `ufw status` output is written back as a result file, which the panel
+# displays. Nothing here trusts the API's intent: every rule is verified after
+# it is applied.
+#
+# Installed to /etc/systemd/system by install.sh. Do not edit by hand.
+
+[Unit]
+Description=Arvoo firewall apply helper (ufw)
+Documentation=file:///opt/arvoo/DEPLOYMENT.md
+ConditionPathIsDirectory=/var/lib/arvoo/firewall-spool
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/arvoo/apps/agent
+# Only the built helper is executed, and only with the spool directory as an
+# argument: the unit itself cannot be used to run anything else.
+ExecStart=/usr/bin/node /opt/arvoo/apps/agent/dist/firewall-cli.js --spool /var/lib/arvoo/firewall-spool
+TimeoutStartSec=180
+# ufw writes its rule files here; /etc/arvoo holds the record of what Arvoo
+# applied so a later update can withdraw exactly those rules.
+ReadWritePaths=/etc/ufw /var/lib/ufw /etc/arvoo /var/lib/arvoo
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+# ufw needs netfilter administration; it must not be able to load kernel
+# modules or touch anything else on the system.
+ProtectKernelModules=false
+ProtectKernelLogs=true
+ProtectClock=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+LockPersonality=true
+RemoveIPC=true
+UMask=0077
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=arvoo-ufw

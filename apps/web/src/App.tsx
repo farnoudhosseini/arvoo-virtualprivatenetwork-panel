@@ -19,6 +19,8 @@ import { AlertsPage } from "./pages/Alerts";
 import { AuditPage } from "./pages/Audit";
 import { ActivityPage } from "./pages/Activity";
 import { SettingsPage } from "./pages/Settings";
+import { LoadBalancingPage } from "./pages/LoadBalancing";
+import { FirewallPage } from "./pages/Firewall";
 import { TooltipProvider } from "./components/ui/overlay";
 
 export default function App() {
@@ -44,6 +46,8 @@ export default function App() {
           <Route path="alerts" element={<AlertsPage />} />
           <Route path="audit" element={<AuditPage />} />
           <Route path="activity" element={<ActivityPage />} />
+          <Route path="load-balancing" element={<LoadBalancingPage />} />
+          <Route path="firewall" element={<FirewallPage />} />
           <Route path="settings" element={<SettingsPage />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Route>

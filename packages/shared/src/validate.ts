@@ -9,7 +9,8 @@ import {
   PERFORMANCE_PROFILES,
   profileAdjustments,
 } from "./openvpn";
-import type { OpenVPNStructuredConfig } from "./types";
+import type { OpenVPNStructuredConfig, OpenVPNAuthMode } from "./types";
+import { isValidDomain, isIPv4 } from "./firewall";
 
 export interface FieldIssue {
   field: string;
@@ -151,7 +152,38 @@ export function validateOpenVPNConfig(cfg: OpenVPNStructuredConfig): ValidationR
   }
 
   if (cfg.compression !== "off") {
-    errors.push({ field: "compression", message: "Compression must be off (VUVNARA/CRIME risk and CPU waste)." });
+    errors.push({ field: "compression",    message: "Compression must be off (VORACLE/CRIME risk and CPU waste)." });
+  }
+
+  // Optional public domain (spec §40). Stored as an empty string by some
+  // clients; both null and "" mean "no domain configured".
+  const domain = typeof cfg.domain === "string" && cfg.domain.trim() !== "" ? cfg.domain.trim() : null;
+  if (domain) {
+    if (isIPv4(domain)) {
+      errors.push({
+        field: "domain",
+        message: "domain must be a DNS name (e.g. vpn.example.com). Use the node address field for raw IPs.",
+      });
+    } else if (!isValidDomain(domain)) {
+      errors.push({
+        field: "domain",
+        message: `"${domain}" is not a valid DNS name (lowercase letters, digits, dashes and dots; at least two labels).`,
+      });
+    } else if (!domain.includes(".")) {
+      errors.push({ field: "domain", message: "domain must be fully qualified (for example vpn.example.com)." });
+    }
+  }
+
+  // Client authentication mode (spec §39).
+  const authMode = cfg.authMode ?? "certificate";
+  if (authMode !== "certificate" && authMode !== "password" && authMode !== "certificate+password") {
+    errors.push({ field: "authMode", message: "authMode must be certificate, password or certificate+password." });
+  }
+  if (authMode !== "certificate" && cfg.tlsMode === "none" && cfg.performanceProfile !== "compatibility") {
+    warnings.push({
+      field: "tlsMode",
+      message: "Password authentication without a TLS control-channel key sends the password inside the TLS session only; tls-crypt is recommended.",
+    });
   }
 
   return {
@@ -159,4 +191,37 @@ export function validateOpenVPNConfig(cfg: OpenVPNStructuredConfig): ValidationR
     errors,
     warnings,
   };
+}
+
+/**
+ * Credential shape shared by the API and the agent. The username is what a VPN
+ * user types into their client; it is not the panel account and not the node id.
+ */
+export function validateOvpnUsername(username: string): string | null {
+  if (username.length < 3 || username.length > 63) {
+    return "OpenVPN username must be 3-63 characters long.";
+  }
+  if (!/^[A-Za-z0-9][A-Za-z0-9_.@-]*$/.test(username)) {
+    return "OpenVPN username may contain letters, digits, dots, dashes, underscores and @, and must start with a letter or digit.";
+  }
+  return null;
+}
+
+/** Password policy for OpenVPN credentials (never logged, never returned). */
+export function validateOvpnPassword(password: string): string | null {
+  if (password.length < 10 || password.length > 128) {
+    return "OpenVPN password must be 10-128 characters long.";
+  }
+  if (!/[A-Za-z]/.test(password) || !/[0-9]/.test(password)) {
+    return "OpenVPN password must contain at least one letter and one digit.";
+  }
+  if (/\s/.test(password)) {
+    return "OpenVPN password may not contain whitespace.";
+  }
+  return null;
+}
+
+/** Normalize the stored auth mode, treating absent as the historical default. */
+export function normalizeAuthMode(mode: OpenVPNAuthMode | undefined | null): OpenVPNAuthMode {
+  return mode === "password" || mode === "certificate+password" ? mode : "certificate";
 }

@@ -11,6 +11,7 @@
 import type {
   OpenVPNStructuredConfig,
   PerformanceProfile,
+  OpenVPNAuthMode,
 } from "./types";
 
 export interface ProfileNotes {
@@ -163,13 +164,21 @@ export function generateOpenVPNServerConfig(
     push();
   }
 
+  const authMode = cfg.authMode ?? "certificate";
+
   push(`# --- PKI ---`);
   push(`ca ${ctx.configDir}/pki/ca.crt`);
   push(`cert ${ctx.configDir}/pki/server.crt`);
   push(`key ${ctx.configDir}/pki/server.key`);
   if (tlsMode === "tls-crypt") push(`tls-crypt ${ctx.configDir}/pki/tls-crypt.key`);
   if (tlsMode === "tls-auth") push(`tls-auth ${ctx.configDir}/pki/tls-auth.key 0`);
-  push(`verify-client-cert require`);
+  if (authMode === "password") {
+    // Username/password is the only factor; the client certificate is accepted
+    // but not required (CERT_REQUIRED would defeat password-only deployments).
+    push(`verify-client-cert optional`);
+  } else {
+    push(`verify-client-cert require`);
+  }
   push(`remote-cert-tls client`);
   push(`tls-version-min ${cfg.tlsVersionMin}`);
   push();
@@ -215,6 +224,12 @@ export function generateOpenVPNServerConfig(
 
   push(`# --- Client admission (Arvoo enforcement hooks) ---`);
   push(`script-security 2`);
+  if (authMode !== "certificate") {
+    // The node verifies username/password against hashes pushed by the control
+    // plane; the plaintext password exists only inside this TLS session.
+    push(`auth-user-pass-verify ${ctx.configDir}/hooks/auth-user-pass via-file`);
+    push(`username-as-common-name`);
+  }
   push(`client-connect ${ctx.configDir}/hooks/client-connect`);
   push(`client-disconnect ${ctx.configDir}/hooks/client-disconnect`);
   push();
@@ -230,10 +245,53 @@ export function generateOpenVPNServerConfig(
 }
 
 /**
+ * Format raw entropy as an OpenVPN static key (V1).
+ *
+ * OpenVPN requires exactly this format for `tls-auth`/`tls-crypt` keys - a raw
+ * blob or a hex string is rejected at start-up - so both the server key file
+ * and the inline key in client profiles are produced from here.
+ */
+export function formatStaticKeyV1(raw: Buffer): string {
+  if (raw.length !== 256) {
+    throw new Error(`An OpenVPN static key must be exactly 256 bytes (got ${raw.length})`);
+  }
+  const hex = raw.toString("hex");
+  const lines: string[] = [];
+  for (let i = 0; i < hex.length; i += 32) lines.push(hex.slice(i, i + 32));
+  return [
+    "#",
+    "# 2048 bit OpenVPN static key",
+    "#",
+    "-----BEGIN OpenVPN Static key V1-----",
+    ...lines,
+    "-----END OpenVPN Static key V1-----",
+    "",
+  ].join("\n");
+}
+
+/** True when the text is a usable OpenVPN static key file. */
+export function isStaticKeyV1(text: string | null | undefined): boolean {
+  if (!text) return false;
+  return (
+    text.includes("-----BEGIN OpenVPN Static key V1-----") &&
+    text.includes("-----END OpenVPN Static key V1-----")
+  );
+}
+
+/**
  * Generate a client .ovpn profile with inline PKI material.
  */
 export function generateClientOvpn(opts: {
+  /** Domain when configured, otherwise the node's real address. */
   serverAddress: string;
+  /**
+   * The exact CN the generated server certificate carries. Pinning the wrong
+   * name makes every client refuse the server, so the control plane passes the
+   * same value the PKI service put into the certificate.
+   */
+  verifyX509Name?: string;
+  /** Client authentication mode; password modes add `auth-user-pass`. */
+  authMode?: OpenVPNAuthMode;
   port: number;
   transport: "udp" | "tcp";
   ca: string;
@@ -266,7 +324,7 @@ export function generateClientOvpn(opts: {
   lines.push(`persist-key`);
   lines.push(`persist-tun`);
   lines.push(`remote-cert-tls server`);
-  lines.push(`verify-x509-name server-name`);
+  lines.push(`verify-x509-name ${opts.verifyX509Name ?? "server-name"}`);
   lines.push(`tls-version-min ${opts.tlsVersionMin}`);
   lines.push(`data-ciphers ${opts.dataCiphers.join(":")}`);
   if (opts.fallbackCipher) lines.push(`data-ciphers-fallback ${opts.fallbackCipher}`);
@@ -276,6 +334,11 @@ export function generateClientOvpn(opts: {
   if (opts.redirectGateway) lines.push(`redirect-gateway def1 bypass-dhcp`);
   for (const dns of opts.dnsServers) lines.push(`dhcp-option DNS ${dns}`);
   for (const r of opts.pushRoutes) lines.push(`route ${r}`);
+  if (opts.authMode === "password" || opts.authMode === "certificate+password") {
+    // Prompts for the OpenVPN username/password issued in the panel. These are
+    // not the panel login and not the node identity.
+    lines.push(`auth-user-pass`);
+  }
   lines.push(`verb 3`);
   lines.push(``);
   lines.push(inline("ca", opts.ca));

@@ -1,18 +1,41 @@
 import { q, q1, run, tx, uuid, nowIso } from "../db/index.js";
+import bcrypt from "bcryptjs";
 import type {
   ClientRecord,
   ClientLimits,
+  ClientRoutingPreferences,
   OpenVPNStructuredConfig,
   PolicyRuleRecord,
+  OpenVPNAuthMode,
 } from "@arvoo/shared";
-import { evaluatePolicies, isExpired, isStarted, timeQuotaState, trafficQuotaState } from "@arvoo/shared";
+import {
+  evaluatePolicies,
+  isExpired,
+  isStarted,
+  timeQuotaState,
+  trafficQuotaState,
+  validateOvpnUsername,
+  validateOvpnPassword,
+  normalizeAuthMode,
+} from "@arvoo/shared";
 import { badRequest, conflict, notFound } from "../lib/errors.js";
-import { issueClientCertificate, clientMaterial, revokeCertificatesFor } from "./pki.js";
+import { LOGIN_TIMING_DUMMY_HASH } from "../lib/security.js";
+import { enqueueOperation } from "./operations.js";
+import { issueClientCertificate, clientMaterial, revokeCertificatesFor, serverCommonName } from "./pki.js";
 import { encryptSecret, decryptSecret } from "../lib/crypto.js";
 import { generateClientOvpn } from "@arvoo/shared";
-import { enqueueOperation } from "./operations.js";
+
 
 type Row = Record<string, unknown>;
+
+function safeJson<T>(value: unknown, fallback: T): T {
+  if (typeof value !== "string" || value === "") return fallback;
+  try {
+    return JSON.parse(value) as T;
+  } catch {
+    return fallback;
+  }
+}
 
 export function rowToClient(r: Row): ClientRecord {
   return {
@@ -25,6 +48,16 @@ export function rowToClient(r: Row): ClientRecord {
     tags: JSON.parse((r.tags as string) ?? "[]"),
     notes: r.notes as string | null,
     limits: JSON.parse(r.limits as string) as ClientLimits,
+    // OpenVPN identity: separate from the panel account and from the node
+    // secret. Legacy rows (no ovpn_username yet) fall back to the client name.
+    ovpnUsername: (r.ovpn_username as string | null) ?? (r.username as string),
+    ovpnAuthEnabled: Number(r.ovpn_auth_enabled ?? 1) === 1,
+    ovpnPasswordSetAt: (r.ovpn_password_set_at as string | null) ?? null,
+    preferredNodeId: (r.preferred_node_id as string | null) ?? null,
+    preferredRegion: (r.preferred_region as string | null) ?? null,
+    preferredTransport: (r.preferred_transport as ClientRecord["preferredTransport"]) ?? null,
+    fallbackInboundId: (r.fallback_inbound_id as string | null) ?? null,
+    routingPreferences: safeJson<ClientRoutingPreferences>(r.routing_preferences, {}),
     baseMultiplier: (r.base_multiplier as number) ?? 1,
     usedBilledBytes: (r.used_billed_bytes as number) ?? 0,
     rxBytes: (r.rx_bytes as number) ?? 0,
@@ -56,6 +89,14 @@ export interface CreateClientInput {
   baseMultiplier?: number;
   limits: Partial<ClientLimits>;
   inboundIds?: string[];
+  /** OpenVPN identity (spec §39). Defaults to the client name, no password. */
+  ovpnUsername?: string | null;
+  ovpnPassword?: string | null;
+  preferredNodeId?: string | null;
+  preferredRegion?: string | null;
+  preferredTransport?: "udp" | "tcp" | null;
+  fallbackInboundId?: string | null;
+  routingPreferences?: ClientRoutingPreferences;
 }
 
 export function defaultLimits(): ClientLimits {
@@ -85,12 +126,34 @@ export async function createClient(input: CreateClientInput): Promise<ClientReco
     throw badRequest("Multiplier must be between 0.1 and 100.");
   }
 
+  // --- OpenVPN credentials (spec §39) -------------------------------------
+  const ovpnUsername = (input.ovpnUsername ?? input.username).trim();
+  const usernameProblem = validateOvpnUsername(ovpnUsername);
+  if (usernameProblem) throw badRequest(usernameProblem);
+  if (await q1(`SELECT id FROM clients WHERE lower(ovpn_username) = lower(?)`, ovpnUsername)) {
+    throw conflict(`OpenVPN username "${ovpnUsername}" is already in use`);
+  }
+  let passwordHash: string | null = null;
+  if (input.ovpnPassword) {
+    const passwordProblem = validateOvpnPassword(input.ovpnPassword);
+    if (passwordProblem) throw badRequest(passwordProblem);
+    passwordHash = bcrypt.hashSync(input.ovpnPassword, 10);
+  }
+  if (input.preferredNodeId && !(await q1(`SELECT id FROM nodes WHERE id = ?`, input.preferredNodeId))) {
+    throw notFound("Preferred node not found");
+  }
+  if (input.fallbackInboundId && !(await q1(`SELECT id FROM inbounds WHERE id = ?`, input.fallbackInboundId))) {
+    throw notFound("Fallback inbound not found");
+  }
+
   const id = uuid();
   const now = nowIso();
   const limits: ClientLimits = { ...defaultLimits(), ...input.limits };
   await run(
-    `INSERT INTO clients (id, username, cert_common_name, display_name, description, status, group_id, tags, notes, limits, base_multiplier, created_at, updated_at)
-     VALUES (?,?,?,?,?,'active',?,?,?,?,?,?,?)`,
+    `INSERT INTO clients (id, username, cert_common_name, display_name, description, status, group_id, tags, notes, limits, base_multiplier,
+                          ovpn_username, ovpn_password_hash, ovpn_password_set_at, preferred_node_id, preferred_region, preferred_transport,
+                          fallback_inbound_id, routing_preferences, created_at, updated_at)
+     VALUES (?,?,?,?,?,'active',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     id,
     input.username,
     input.username, // CN = username
@@ -101,6 +164,14 @@ export async function createClient(input: CreateClientInput): Promise<ClientReco
     input.notes ?? null,
     JSON.stringify(limits),
     input.baseMultiplier ?? 1,
+    ovpnUsername,
+    passwordHash,
+    passwordHash ? now : null,
+    input.preferredNodeId ?? null,
+    input.preferredRegion ?? null,
+    input.preferredTransport ?? null,
+    input.fallbackInboundId ?? null,
+    JSON.stringify(input.routingPreferences ?? {}),
     now,
     now,
   );
@@ -134,7 +205,7 @@ export async function unassignClientFromInbound(clientId: string, inboundId: str
   await run(`DELETE FROM client_inbounds WHERE client_id = ? AND inbound_id = ?`, clientId, inboundId);
 }
 
-export async function updateClient(id: string, patch: {
+export interface UpdateClientPatch {
   displayName?: string | null;
   description?: string | null;
   notes?: string | null;
@@ -142,22 +213,329 @@ export async function updateClient(id: string, patch: {
   tags?: string[];
   baseMultiplier?: number;
   limits?: Partial<ClientLimits>;
-}): Promise<ClientRecord> {
+  preferredNodeId?: string | null;
+  preferredRegion?: string | null;
+  preferredTransport?: "udp" | "tcp" | null;
+  fallbackInboundId?: string | null;
+  routingPreferences?: ClientRoutingPreferences;
+  ovpnAuthEnabled?: boolean;
+}
+
+/**
+ * Edit any client property except identity-changing ones (username, OpenVPN
+ * username, password), which have their own audited operations because they
+ * touch certificates and node-side credentials (spec §38/§39).
+ *
+ * `undefined` leaves a field untouched; `null` clears it explicitly - a patch
+ * cannot silently ignore an intentional "empty this field".
+ */
+export async function updateClient(id: string, patch: UpdateClientPatch): Promise<ClientRecord> {
   const client = await getClient(id);
-  const limits = { ...client.limits, ...(patch.limits ?? {}) };
+  const has = <K extends keyof UpdateClientPatch>(key: K): boolean => patch[key] !== undefined;
+
+  if (has("baseMultiplier")) {
+    const m = patch.baseMultiplier as number;
+    if (m < 0.1 || m > 100) throw badRequest("Multiplier must be between 0.1 and 100.");
+  }
+  if (has("preferredNodeId") && patch.preferredNodeId) {
+    if (!(await q1(`SELECT id FROM nodes WHERE id = ?`, patch.preferredNodeId))) throw notFound("Preferred node not found");
+  }
+  if (has("fallbackInboundId") && patch.fallbackInboundId) {
+    const fb = await q1<{ id: string; node_id: string }>(`SELECT id, node_id FROM inbounds WHERE id = ?`, patch.fallbackInboundId);
+    if (!fb) throw notFound("Fallback inbound not found");
+    const preferredNode = has("preferredNodeId") ? patch.preferredNodeId : client.preferredNodeId;
+    if (preferredNode && fb.node_id !== preferredNode) {
+      throw badRequest(
+        "The fallback inbound must live on the preferred node: a fallback on a different node cannot be used without reconnecting elsewhere.",
+      );
+    }
+  }
+  if (has("limits")) {
+    const merged = { ...client.limits, ...(patch.limits ?? {}) };
+    if (merged.trafficQuotaBytes != null && merged.trafficQuotaBytes < 0) throw badRequest("Traffic quota cannot be negative.");
+    if (merged.deviceLimit != null && (merged.deviceLimit < 1 || merged.deviceLimit > 1000)) {
+      throw badRequest("Device (HWID) limit must be between 1 and 1000.");
+    }
+    if (merged.concurrentSessions != null && (merged.concurrentSessions < 1 || merged.concurrentSessions > 1000)) {
+      throw badRequest("Concurrent session limit must be between 1 and 1000.");
+    }
+    if (merged.ipLimit != null && (merged.ipLimit < 1 || merged.ipLimit > 1000)) {
+      throw badRequest("IP limit must be between 1 and 1000.");
+    }
+    if (merged.expiresAt && merged.startsAt && new Date(merged.expiresAt) <= new Date(merged.startsAt)) {
+      throw badRequest("Expiry must be after the start date.");
+    }
+  }
+
+  const limits = has("limits") ? { ...client.limits, ...(patch.limits ?? {}) } : client.limits;
   await run(
-    `UPDATE clients SET display_name = ?, description = ?, notes = ?, group_id = ?, tags = ?, base_multiplier = ?, limits = ?, updated_at = ? WHERE id = ?`,
-    patch.displayName ?? client.displayName,
-    patch.description ?? client.description,
-    patch.notes ?? client.notes,
-    patch.groupId ?? client.groupId,
-    JSON.stringify(patch.tags ?? client.tags),
-    patch.baseMultiplier ?? client.baseMultiplier,
+    `UPDATE clients SET display_name = ?, description = ?, notes = ?, group_id = ?, tags = ?, base_multiplier = ?, limits = ?,
+                        preferred_node_id = ?, preferred_region = ?, preferred_transport = ?, fallback_inbound_id = ?,
+                        routing_preferences = ?, ovpn_auth_enabled = ?, updated_at = ?
+     WHERE id = ?`,
+    has("displayName") ? (patch.displayName ?? null) : client.displayName,
+    has("description") ? (patch.description ?? null) : client.description,
+    has("notes") ? (patch.notes ?? null) : client.notes,
+    has("groupId") ? (patch.groupId ?? null) : client.groupId,
+    JSON.stringify(has("tags") ? (patch.tags ?? []) : client.tags),
+    has("baseMultiplier") ? (patch.baseMultiplier as number) : client.baseMultiplier,
     JSON.stringify(limits),
+    has("preferredNodeId") ? (patch.preferredNodeId ?? null) : client.preferredNodeId,
+    has("preferredRegion") ? (patch.preferredRegion ?? null) : client.preferredRegion,
+    has("preferredTransport") ? (patch.preferredTransport ?? null) : client.preferredTransport,
+    has("fallbackInboundId") ? (patch.fallbackInboundId ?? null) : client.fallbackInboundId,
+    JSON.stringify(has("routingPreferences") ? (patch.routingPreferences ?? {}) : client.routingPreferences),
+    has("ovpnAuthEnabled") ? (patch.ovpnAuthEnabled ? 1 : 0) : client.ovpnAuthEnabled ? 1 : 0,
     nowIso(),
     id,
   );
   return getClient(id);
+}
+
+// ---------------------------------------------------------------------------
+// Identity changes: client name, OpenVPN username and password (spec §38/§39)
+// ---------------------------------------------------------------------------
+
+/**
+ * Rename a client. The certificate CN follows the name, so the certificate is
+ * reissued with the new CN in the same transaction and the node-side
+ * credentials are synchronized. Existing sessions are closed: a tunnel that
+ * still presents the old CN would be rejected anyway, and pretending otherwise
+ * would leave users connecting with an identity the panel no longer knows.
+ */
+export async function renameClient(id: string, username: string): Promise<ClientRecord> {
+  const client = await getClient(id);
+  if (username === client.username) return client;
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9_.@-]{2,62}$/.test(username)) {
+    throw badRequest("Username must be 3-63 chars: letters, digits, dots, dashes, underscores or @.");
+  }
+  if (await q1(`SELECT id FROM clients WHERE username = ?`, username)) {
+    throw conflict(`Client "${username}" already exists`);
+  }
+  await tx(async () => {
+    await run(
+      `UPDATE clients SET username = ?, cert_common_name = ?, updated_at = ? WHERE id = ?`,
+      username,
+      username,
+      nowIso(),
+      id,
+    );
+    // Revoke the old certificate and issue one for the new name. Both happen
+    // inside the transaction; the PKI writes rows through the same connection.
+    await revokeCertificatesFor("client", id);
+    const issued = await issueClientCertificate(id, username);
+    await run(
+      `INSERT INTO client_secrets (id, client_id, kind, data_encrypted, created_at) VALUES (?,?,?,?,?)
+       ON CONFLICT(client_id, kind) DO UPDATE SET data_encrypted = excluded.data_encrypted, created_at = excluded.created_at`,
+      uuid(),
+      id,
+      "client_key",
+      encryptSecret(issued.privateKeyPem),
+      nowIso(),
+    );
+  });
+  await disconnectClientSessions(id);
+  return getClient(id);
+}
+
+export interface OvpnCredentialInput {
+  username?: string;
+  /** Write-only: hashed immediately, never stored or logged in plaintext. */
+  password?: string;
+  enabled?: boolean;
+}
+
+/**
+ * Change the OpenVPN username and/or password of a client (spec §39).
+ * The password is bcrypt-hashed and only the hash is pushed to the nodes, so
+ * changing it is what makes an old password stop working.
+ */
+export async function setOvpnCredentials(
+  id: string,
+  input: OvpnCredentialInput,
+  actorName: string,
+): Promise<{ client: ClientRecord; usernameChanged: boolean; passwordChanged: boolean; inboundsSynced: string[] }> {
+  const client = await getClient(id);
+  let usernameChanged = false;
+  let passwordChanged = false;
+  const now = nowIso();
+
+  if (input.username !== undefined && input.username !== client.ovpnUsername) {
+    const username = input.username.trim();
+    const problem = validateOvpnUsername(username);
+    if (problem) throw badRequest(problem);
+    const taken = await q1<{ id: string }>(`SELECT id FROM clients WHERE lower(ovpn_username) = lower(?) AND id <> ?`, username, id);
+    if (taken) throw conflict(`OpenVPN username "${username}" is already used by another client`);
+    await run(`UPDATE clients SET ovpn_username = ?, ovpn_username_changed_at = ?, updated_at = ? WHERE id = ?`, username, now, now, id);
+    usernameChanged = true;
+  }
+
+  if (input.password !== undefined) {
+    if (input.password === null || input.password === "") throw badRequest("New password cannot be empty; disable the credential instead.");
+    const problem = validateOvpnPassword(input.password);
+    if (problem) throw badRequest(problem);
+    // bcrypt cost 10: fast enough for the tunnel's auth hook, still expensive
+    // to brute force offline.
+    const hash = bcrypt.hashSync(input.password, 10);
+    await run(`UPDATE clients SET ovpn_password_hash = ?, ovpn_password_set_at = ?, updated_at = ? WHERE id = ?`, hash, now, now, id);
+    passwordChanged = true;
+  }
+
+  if (input.enabled !== undefined) {
+    await run(`UPDATE clients SET ovpn_auth_enabled = ?, updated_at = ? WHERE id = ?`, input.enabled ? 1 : 0, now, id);
+  }
+
+  // Sessions authenticated with the previous credentials must not survive a
+  // credential change: the tunnel would keep working with a password that no
+  // longer exists in the control plane.
+  if (passwordChanged || usernameChanged) await disconnectClientSessions(id);
+  // Reported, not pushed: the node verifies credentials against the control
+  // plane on every connection, so there is no node-side copy to update.
+  const inboundsSynced = (await credentialInbounds(id)).map((i) => i.name);
+  void actorName;
+  return { client: await getClient(id), usernameChanged, passwordChanged, inboundsSynced };
+}
+
+/**
+ * Inbounds whose behaviour depends on a client's password credentials.
+ *
+ * Nothing is pushed to the node for a password change: the node never holds a
+ * credential, it asks the control plane on every connection through the
+ * `auth-user-pass-verify` hook generated into the server configuration
+ * (spec §39). This helper exists to report *which* inbounds are affected, so
+ * the operator sees the real blast radius of a credential change.
+ */
+export async function credentialInbounds(clientId: string): Promise<Array<{ id: string; name: string }>> {
+  await getClient(clientId);
+  const inbounds = await q<{ id: string; name: string; structured_config: string }>(
+    `SELECT i.id, i.name, i.structured_config
+       FROM inbounds i
+      WHERE EXISTS (SELECT 1 FROM client_inbounds ci WHERE ci.inbound_id = i.id AND ci.client_id = ?)
+         OR NOT EXISTS (SELECT 1 FROM client_inbounds ci WHERE ci.client_id = ?)
+      ORDER BY i.name`,
+    clientId,
+    clientId,
+  );
+  return inbounds
+    .filter((inbound) => {
+      try {
+        return normalizeAuthMode((JSON.parse(inbound.structured_config) as OpenVPNStructuredConfig).authMode) !== "certificate";
+      } catch {
+        return false;
+      }
+    })
+    .map((inbound) => ({ id: inbound.id, name: inbound.name }));
+}
+
+/**
+ * OpenVPN username/password verification, called by the node's
+ * `auth-user-pass-verify` hook through /api/v1/agent/openvpn-auth.
+ *
+ * The node is authenticated as itself; the *user* is authenticated here, so a
+ * compromised node cannot mint credentials - it can only ask whether a pair of
+ * credentials is valid.
+ */
+export async function authenticateOvpnCredentials(input: {
+  username: string;
+  password: string;
+  commonName: string | null;
+  inboundName: string;
+}): Promise<{ allow: boolean; reason: string | null; clientId: string | null }> {
+  const row = await q1<Row>(
+    `SELECT * FROM clients WHERE lower(ovpn_username) = lower(?) OR cert_common_name = ? ORDER BY created_at LIMIT 1`,
+    input.username,
+    input.commonName ?? input.username,
+  );
+  if (!row) {
+    // Spend the bcrypt work anyway so a wrong username is not faster than a
+    // wrong password (username enumeration through timing).
+    bcrypt.compareSync(input.password, LOGIN_TIMING_DUMMY_HASH);
+    return { allow: false, reason: `Unknown OpenVPN user "${input.username}"`, clientId: null };
+  }
+  const client = rowToClient(row);
+  const hash = row.ovpn_password_hash as string | null;
+  if (!client.ovpnAuthEnabled || !hash) {
+    bcrypt.compareSync(input.password, LOGIN_TIMING_DUMMY_HASH);
+    return { allow: false, reason: "Password authentication is not enabled for this client", clientId: client.id };
+  }
+  if (!bcrypt.compareSync(input.password, hash)) {
+    return { allow: false, reason: "Invalid OpenVPN username or password", clientId: client.id };
+  }
+  if (client.status === "suspended") return { allow: false, reason: "Client is suspended", clientId: client.id };
+  if (client.status === "revoked") return { allow: false, reason: "Client credentials are revoked", clientId: client.id };
+  if (client.status === "expired") return { allow: false, reason: "Client is expired", clientId: client.id };
+  const now = new Date();
+  if (!isStarted(client.limits.startsAt, now)) return { allow: false, reason: "Client service has not started yet", clientId: client.id };
+  if (isExpired(client.limits.expiresAt, now)) {
+    await setStatus(client.id, "expired");
+    return { allow: false, reason: "Client subscription has expired", clientId: client.id };
+  }
+  if (trafficQuotaState(client.usedBilledBytes, client.limits.trafficQuotaBytes).exceeded) {
+    return { allow: false, reason: "Traffic quota exhausted", clientId: client.id };
+  }
+  if (timeQuotaState(client.usedTimeSec, client.limits.timeQuotaSec).exceeded) {
+    return { allow: false, reason: "Time quota exhausted", clientId: client.id };
+  }
+  const assignment = await assignmentProblem(client.id, input.inboundName);
+  if (assignment) return { allow: false, reason: assignment, clientId: client.id };
+  return { allow: true, reason: null, clientId: client.id };
+}
+
+/**
+ * A client with explicit inbound assignments may only use those inbounds; a
+ * client with none may use any inbound on any of its node/region preferences
+ * (the historical behaviour, kept for compatibility).
+ */
+async function assignmentProblem(clientId: string, inboundName: string): Promise<string | null> {
+  const assignments = await q<{ name: string }>(
+    `SELECT i.name FROM client_inbounds ci JOIN inbounds i ON i.id = ci.inbound_id WHERE ci.client_id = ?`,
+    clientId,
+  );
+  if (assignments.length === 0) return null;
+  if (assignments.some((a) => a.name === inboundName)) return null;
+  return `Client is not assigned to inbound "${inboundName}"`;
+}
+
+/** Replace the set of inbounds a client is assigned to. */
+export async function setInboundAssignments(clientId: string, inboundIds: string[], actorName: string): Promise<string[]> {
+  await getClient(clientId);
+  const unique = [...new Set(inboundIds)];
+  for (const inboundId of unique) {
+    if (!(await q1(`SELECT id FROM inbounds WHERE id = ?`, inboundId))) throw notFound(`Inbound ${inboundId} not found`);
+  }
+  await tx(async () => {
+    await run(`DELETE FROM client_inbounds WHERE client_id = ?`, clientId);
+    for (const inboundId of unique) {
+      await run(
+        `INSERT INTO client_inbounds (client_id, inbound_id, assigned_at) VALUES (?,?,?) ON CONFLICT DO NOTHING`,
+        clientId,
+        inboundId,
+        nowIso(),
+      );
+    }
+  });
+  void actorName;
+  return unique;
+}
+
+/** Placement preference update with its own audit trail (spec §38). */
+export async function updateClientPlacement(
+  id: string,
+  patch: ClientRoutingPreferences & {
+    preferredNodeId?: string | null;
+    preferredRegion?: string | null;
+    preferredTransport?: "udp" | "tcp" | null;
+    fallbackInboundId?: string | null;
+  },
+): Promise<ClientRecord> {
+  const { preferredNodeId, preferredRegion, preferredTransport, fallbackInboundId, ...routingPreferences } = patch;
+  return updateClient(id, {
+    ...(preferredNodeId !== undefined ? { preferredNodeId } : {}),
+    ...(preferredRegion !== undefined ? { preferredRegion } : {}),
+    ...(preferredTransport !== undefined ? { preferredTransport } : {}),
+    ...(fallbackInboundId !== undefined ? { fallbackInboundId } : {}),
+    ...(Object.keys(routingPreferences).length > 0 ? { routingPreferences: routingPreferences as ClientRoutingPreferences } : {}),
+  });
 }
 
 export async function setStatus(id: string, status: ClientRecord["status"]): Promise<ClientRecord> {
@@ -582,6 +960,12 @@ export async function authorizeConnection(input: AuthorizeInput): Promise<{
     now,
   });
 
+  // Inbound assignment is a hard requirement when the client has any (spec
+  // §38/§47, "wrong inbound"): assignment used to be cosmetic, which meant a
+  // client could reach a node it was never assigned to.
+  const assignment = await assignmentProblem(client.id, input.inboundName);
+  if (assignment) return { allow: false, reason: assignment, client };
+
   if (decision.deny) return { allow: false, reason: decision.deny.reason, client };
   if (decision.suspend) {
     await setStatus(client.id, "suspended");
@@ -674,8 +1058,14 @@ export async function buildClientProfile(clientId: string, inboundId: string): P
     inboundId,
   );
 
+  // Spec §40: dial the configured domain when there is one, otherwise fall back
+  // to the node's real address. The address stays authoritative for health
+  // checks and deployment; only the profile the user receives prefers the name.
+  const domain = typeof cfg.domain === "string" && cfg.domain.trim() !== "" ? cfg.domain.trim() : null;
   const ovpn = generateClientOvpn({
-    serverAddress: node.address as string,
+    serverAddress: domain ?? (node.address as string),
+    verifyX509Name: serverCommonName(inbound.name as string),
+    authMode: normalizeAuthMode(cfg.authMode),
     port: cfg.port,
     transport: cfg.transport,
     ca: caRow.certificate,

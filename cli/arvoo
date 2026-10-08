@@ -772,6 +772,141 @@ cmd_restore() {
 # security audit (spec §35)
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# firewall (managed ufw)
+# ---------------------------------------------------------------------------
+
+# Admin session for firewall commands. Credentials come from the environment or
+# an interactive prompt; they are never passed as arguments and never logged.
+api_admin_token() {
+  local user="${ARVOO_ADMIN_USER:-admin}" password="${ARVOO_ADMIN_PASSWORD:-}" token=""
+  if [[ -z "$password" ]]; then
+    [[ -t 0 ]] || return 1
+    read -r -p "Arvoo admin username [$user]: " input_user
+    if [[ -n "${input_user:-}" ]]; then user="$input_user"; fi
+    read -r -s -p "Password for $user (not stored): " password; printf '\n'
+  fi
+  token="$(api_login_token "$user" "$password")"
+  unset password
+  [[ -n "$token" ]] || return 1
+  printf '%s' "$token"
+}
+
+firewall_plan_json() {
+  local host="$1" token="$2"
+  curl -fsS --max-time 20 "$(api_base)/api/v1/firewall/plan?host=$(printf '%s' "$host" | sed 's/[^A-Za-z0-9._-]//g')" \
+    -H "Authorization: Bearer $token" 2>/dev/null
+}
+
+firewall_apply_api() {
+  local host="$1" action="$2" token="$3"
+  curl -fsS --max-time 30 -X POST "$(api_base)/api/v1/firewall/apply" \
+    -H "Authorization: Bearer $token" -H 'Content-Type: application/json' \
+    --data-binary "$(printf '{"host":"%s","action":"%s"}' "$(json_escape "$host")" "$action")" 2>/dev/null
+}
+
+# Apply the plan that the control plane computed for THIS host, locally.
+# Used when the systemd path unit is not installed, and by '--local'.
+firewall_apply_local() {
+  require_root "firewall apply --local"
+  local token="$1"
+  local helper="/opt/arvoo/apps/agent/dist/firewall-cli.js"
+  [[ -f "$helper" ]] || die "$helper is missing; run ./install.sh --update first"
+  local plan_json tmp
+  plan_json="$(firewall_plan_json self "$token")"
+  [[ -n "$plan_json" ]] || die "could not read the firewall plan from the control plane"
+  tmp="$(mktemp /tmp/arvoo-firewall-plan.XXXXXX)"
+  chmod 600 "$tmp"
+  printf '%s' "$plan_json" | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["plan"]))' > "$tmp" || die "could not parse the plan"
+  if node "$helper" --plan "$tmp" --action "${ACTION:-enable}"; then
+    ok "firewall applied locally on this host (action: ${ACTION:-enable})"
+  else
+    warn "the helper reported a problem; the output above is the real ufw result"
+  fi
+  rm -f "$tmp"
+}
+
+cmd_firewall() {
+  require_linux
+  local action="${1:-status}"
+  local host="self" target_action="enable"
+  shift || true
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --host) host="${2:-self}"; shift 2 ;;
+      --self) host="self"; shift ;;
+      --local) LOCAL_ONLY=1; shift ;;
+      *) die "usage: arvoo firewall status|plan|enable|update|disable [--host self|<node-id>] [--local]" ;;
+    esac
+  done
+
+  local token; token="$(api_admin_token)" || die "an admin session is required (set ARVOO_ADMIN_USER/ARVOO_ADMIN_PASSWORD or answer the prompt)"
+
+  case "$action" in
+    status)
+      local overview
+      overview="$(curl -fsS --max-time 20 "$(api_base)/api/v1/firewall" -H "Authorization: Bearer $token" 2>/dev/null || true)"
+      [[ -n "$overview" ]] || die "could not read the firewall overview"
+      if [[ "$JSON" == "1" ]]; then printf '%s\n' "$overview"; return 0; fi
+      hdr "Managed firewall (UFW)"
+      printf '%s' "$overview" | python3 -c '
+import json,sys
+d = json.load(sys.stdin)
+print("  spool dir: %s" % d["spoolDir"])
+p = d["policy"]
+print("  policy: ssh %s · panel %s · icmp %s · inactive inbounds %s" % (
+    ",".join(str(x) for x in p["sshPorts"]), ",".join(str(x) for x in p["panelPorts"]),
+    "allowed" if p["allowIcmp"] else "blocked", "included" if p["includeInactiveInbounds"] else "excluded"))
+for h in d["hosts"]:
+    last = h.get("lastApply") or {}
+    print("  %-28s %-7s %-10s rules=%-3s ports=%-18s %s" % (
+        h["name"][:28], "active" if h["enabled"] else "inactive",
+        "in sync" if h["inSync"] else "out of date", h["rulesCount"],
+        ",".join(str(x) for x in h["publicPorts"]) or "-",
+        ("last %s/%s" % (last.get("action", "?"), last.get("status", "?"))) if last else "never applied"))
+    for w in h.get("warnings", []):
+        print("      ! %s" % w)
+'
+      ;;
+    plan)
+      local plan_json; plan_json="$(firewall_plan_json "$host" "$token")"
+      [[ -n "$plan_json" ]] || die "could not read the firewall plan"
+      if [[ "$JSON" == "1" ]]; then printf '%s\n' "$plan_json"; return 0; fi
+      hdr "Firewall plan for $host"
+      printf '%s' "$plan_json" | python3 -c '
+import json,sys
+d = json.load(sys.stdin)
+print("  hash %s · %d rules · %d to add · %d to remove" % (d["plan"]["hash"], len(d["plan"]["rules"]), len(d["diff"]["added"]), len(d["diff"]["removed"])))
+for w in d["plan"]["warnings"]:
+    print("  ! %s" % w)
+for c in d["commands"]:
+    print("  ufw %s" % " ".join(c["argv"]))
+'
+      ;;
+    enable|update|disable)
+      target_action="$action"
+      if [[ "${LOCAL_ONLY:-0}" == "1" ]]; then
+        ACTION="$target_action" firewall_apply_local "$token"
+        return 0
+      fi
+      confirm "$action the firewall on host '$host' (current rules Arvoo manages are updated, foreign rules are untouched)" || exit "$EXIT_OK"
+      local response; response="$(firewall_apply_api "$host" "$target_action" "$token")" || die "firewall request failed"
+      [[ -n "$response" ]] || die "empty response from the control plane"
+      if [[ "$JSON" == "1" ]]; then printf '%s\n' "$response"; return 0; fi
+      printf '%s' "$response" | python3 -c '
+import json,sys
+d = json.load(sys.stdin)
+status = d["status"]
+print("  %s: %s rules added, %s removed — %s" % (status, len(d["added"]), len(d["removed"]), d["detail"]))
+sys.exit(0 if status in ("queued", "success") else 1)
+' || die "the firewall change was not accepted"
+      say "  verify with: arvoo firewall status"
+      ;;
+    *) die "usage: arvoo firewall status|plan|enable|update|disable [--host self|<node-id>] [--local]" ;;
+  esac
+  unset token
+}
+
 cmd_security_audit() {
   require_linux
   hdr "Local checks"
@@ -911,6 +1046,11 @@ Commands:
   secret rotate          rotate the session signing secret (invalidates sessions)
   management status | enable | rotate | disable
                          second-layer management access secret
+  firewall status | plan | enable | update | disable [--host self|<node>]
+                         managed UFW: SSH + panel + every deployed inbound and
+                         tunnel port of a host, applied and verified with ufw
+                         (--local applies this host's plan directly instead of
+                         going through the privileged helper)
   cert status | cert renew
                          ACME certificate lifecycle
   repair                 idempotent repair through install.sh
@@ -957,6 +1097,9 @@ Arvoo Management CLI
  9. Node status               20. Security audit
 10. Configuration summary     21. Version
 11. Exit                      22. Management secret
+23. Firewall status            24. Config & Enable UFW
+25. Update UFW                26. Firewall plan
+27. Disable UFW
 MENU
     printf 'Select: '
     read -r choice || exit "$EXIT_OK"
@@ -983,6 +1126,11 @@ MENU
       20) cmd_security_audit ;;
       21) cmd_version ;;
       22) cmd_management status ;;
+      23) cmd_firewall status ;;
+      24) cmd_firewall enable ;;
+      25) cmd_firewall update ;;
+      26) cmd_firewall plan ;;
+      27) cmd_firewall disable ;;
       *) printf 'Unknown choice: %s\n' "$choice" >&2 ;;
     esac
   done
@@ -1028,6 +1176,7 @@ case "$command" in
   tunnel)      [[ "$sub" == "status" ]] || die "usage: arvoo tunnel status"; cmd_tunnel_status ;;
   secret)      [[ "$sub" == "rotate" ]] || die "usage: arvoo secret rotate"; cmd_secret_rotate ;;
   management)  cmd_management "${args[1]:-status}" ;;
+  firewall)    cmd_firewall "${args[1]:-status}" "${args[@]:2}" ;;
   cert)        case "$sub" in status) cmd_cert_status ;; renew) cmd_cert_renew ;; *) die "usage: arvoo cert status|renew" ;; esac ;;
   repair)      cmd_repair ;;
   update)      cmd_update ;;

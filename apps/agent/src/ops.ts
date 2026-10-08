@@ -11,12 +11,15 @@ import { createConnection } from "node:net";
 import path from "node:path";
 import type {
   BenchmarkOpInput,
+  FirewallOpInput,
+  FirewallRule,
   GreOpInput,
   IPsecOpInput,
   NodeCapabilities,
   OpenVPNOpInput,
   TunnelTestResult,
 } from "@arvoo/shared";
+import { applyFirewallPlan, ufwAvailable } from "./ufw.js";
 import { exec } from "./linux.js";
 
 export interface OpResult {
@@ -482,6 +485,96 @@ exit 0
 `;
 }
 
+/**
+ * OpenVPN calls this with `via-file`: argv[1] is a temporary file whose first
+ * line is the username and second line the password. The node forwards the
+ * attempt to the control plane with its own node identity - the password is
+ * never compared, cached or logged locally.
+ */
+function authUserPassHookShell(inboundName: string): string {
+  return `#!/bin/sh
+# Arvoo username/password verification hook - generated, do not edit.
+# OpenVPN calls this as: auth-user-pass-verify <this> via-file
+# JSON encoding of the credential is done in the Node helper, so a password
+# containing quotes or percent signs cannot corrupt the request body.
+NODE_BIN="$(command -v node || echo /usr/bin/node)"
+exec "$NODE_BIN" /etc/arvoo/openvpn/${inboundName}/hooks/auth-user-pass.js "$1"
+`;
+}
+
+/**
+ * The Node helper the shell hook execs: it reads the credential file OpenVPN
+ * wrote, posts it to the control plane with the node identity and exits 0
+ * (allow) or 1 (deny). JSON encoding happens here so a password containing
+ * quotes, backslashes or percent signs cannot corrupt the request.
+ */
+function authUserPassHookJs(inboundName: string, controlPlaneUrl: string, nodeSecretFile: string): string {
+  return `#!/usr/bin/env node
+// Arvoo username/password verification helper - generated, do not edit.
+const fs = require("node:fs");
+const process = require("node:process");
+
+const credentialFile = process.argv[2];
+if (!credentialFile) {
+  console.error("arvoo: missing credential file argument");
+  process.exit(1);
+}
+let username = "";
+let password = "";
+try {
+  const lines = fs.readFileSync(credentialFile, "utf8").split(/\r?\n/);
+  username = lines[0] ?? "";
+  password = lines[1] ?? "";
+} catch (err) {
+  console.error("arvoo: cannot read credential file:", err && err.message);
+  process.exit(1);
+}
+
+const secret = fs.readFileSync("${nodeSecretFile}", "utf8").trim();
+const nodeId = fs.readFileSync("/etc/arvoo/node-id", "utf8").trim();
+const body = JSON.stringify({
+  username,
+  password,
+  commonName: process.env.common_name || null,
+  inboundName: "${inboundName}",
+});
+
+const controller = new AbortController();
+const timer = setTimeout(() => controller.abort(), 10000);
+fetch("${controlPlaneUrl}/api/v1/agent/openvpn-auth", {
+  method: "POST",
+  headers: {
+    Authorization: "Bearer arvoo-node " + nodeId + ":" + secret,
+    "Content-Type": "application/json",
+  },
+  body,
+  signal: controller.signal,
+})
+  .then(async (res) => {
+    clearTimeout(timer);
+    const text = await res.text();
+    let allow = false;
+    let reason = "unreadable response from control plane";
+    try {
+      const parsed = JSON.parse(text);
+      allow = parsed.allow === true;
+      reason = parsed.reason ?? reason;
+    } catch {
+      reason = "control plane returned a non-JSON response";
+    }
+    // Only the username and the reason are ever logged - never the password.
+    if (!allow) console.error("arvoo: openvpn auth denied for " + username + ": " + reason);
+    process.exit(allow ? 0 : 1);
+  })
+  .catch((err) => {
+    clearTimeout(timer);
+    // A control plane that cannot be reached is a denial, not an allow.
+    console.error("arvoo: control plane unreachable for openvpn auth:", err && err.message);
+    process.exit(1);
+  });
+`;
+}
+
 export async function applyOpenVPNInbound(
   input: OpenVPNOpInput,
   ctx: { controlPlaneUrl: string; nodeId: string; nodeSecret: string },
@@ -516,11 +609,13 @@ export async function applyOpenVPNInbound(
   await writeFile(`${dir}/pki/ca.crt`, input.pki.ca, { mode: 0o644 });
   await writeFile(`${dir}/pki/server.crt`, input.pki.cert, { mode: 0o644 });
   await writeFile(`${dir}/pki/server.key`, input.pki.key, { mode: 0o600 });
+  // The static key is written exactly as received: OpenVPN only accepts the
+  // "OpenVPN Static key V1" format, so re-encoding it here would corrupt it.
   if (input.pki.tlsKey && input.pki.tlsMode === "tls-crypt") {
-    await writeFile(`${dir}/pki/tls-crypt.key`, Buffer.from(input.pki.tlsKey, "base64"), { mode: 0o600 });
+    await writeFile(`${dir}/pki/tls-crypt.key`, input.pki.tlsKey, { mode: 0o600 });
   }
   if (input.pki.tlsKey && input.pki.tlsMode === "tls-auth") {
-    await writeFile(`${dir}/pki/tls-auth.key`, Buffer.from(input.pki.tlsKey, "base64"), { mode: 0o600 });
+    await writeFile(`${dir}/pki/tls-auth.key`, input.pki.tlsKey, { mode: 0o600 });
   }
 
   // Node secret + id for hooks
@@ -530,6 +625,21 @@ export async function applyOpenVPNInbound(
   await writeFile("/etc/arvoo/node-id", ctx.nodeId, { mode: 0o644 });
   await writeFile(`${dir}/hooks/client-connect`, hookScript("connect", input.inboundName, ctx.controlPlaneUrl, secretFile), { mode: 0o755 });
   await writeFile(`${dir}/hooks/client-disconnect`, hookScript("disconnect", input.inboundName, ctx.controlPlaneUrl, secretFile), { mode: 0o755 });
+
+  // Username/password authentication (spec §39). The hook receives the login
+  // attempt from OpenVPN (`via-file`) and asks the control plane, which is the
+  // only place a password hash ever exists. Nothing is cached on the node, so
+  // changing or revoking a password takes effect on the next connection.
+  if (input.authMode === "password" || input.authMode === "certificate+password") {
+    await writeFile(`${dir}/hooks/auth-user-pass`, authUserPassHookShell(input.inboundName), { mode: 0o755 });
+    await writeFile(`${dir}/hooks/auth-user-pass.js`, authUserPassHookJs(input.inboundName, ctx.controlPlaneUrl, secretFile), {
+      mode: 0o755,
+    });
+  } else {
+    // Certificate-only inbound: remove any hook left by a previous mode so a
+    // stale script can never authenticate a client.
+    await exec("rm", ["-f", `${dir}/hooks/auth-user-pass`]).catch(() => undefined);
+  }
 
   // Port availability check (protocol-aware, argv-only, no shell)
   const inUse = await portIsListening(input.port, input.protocol);
@@ -716,6 +826,35 @@ export async function installOpenVPN(): Promise<OpResult> {
       "(read-only /usr, /etc, /var) and is deliberately not allowed to run a package manager. " +
       "Install it on the node itself - sudo apt-get install -y openvpn (or run sudo ./install.sh) - then retry.",
   };
+}
+
+// ---------------------------------------------------------------------------
+// Managed firewall (ufw) - the apply/verify core lives in ./ufw.ts
+// ---------------------------------------------------------------------------
+
+export async function configureFirewall(input: FirewallOpInput): Promise<OpResult> {
+  if (process.platform !== "linux") return requiresLinux();
+  if (!(await ufwAvailable())) {
+    return {
+      success: false,
+      error: "ufw is not installed on this node. Install it as root (apt-get install -y ufw) and run the action again.",
+    };
+  }
+  // The apply-and-verify core is shared with the master privileged helper
+  // (apps/agent/src/ufw.ts), so a node and the panel host cannot drift apart.
+  const result = await applyFirewallPlan(input.plan, input.action);
+  const output = {
+    added: result.added,
+    removed: result.removed,
+    failures: result.failures,
+    missing: result.missing,
+    enabled: result.enabled,
+    verified: result.verified,
+    status: result.status,
+    rules: input.action === "disable" ? [] : (input.plan.rules as FirewallRule[]),
+  };
+  if (!result.ok) return { success: false, error: result.error ?? "ufw did not confirm the change", output };
+  return { success: true, output };
 }
 
 export async function collectDiagnostics(): Promise<OpResult> {

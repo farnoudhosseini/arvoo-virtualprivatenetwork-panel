@@ -68,7 +68,20 @@ export async function ensureRootCA(): Promise<{ id: string; certificatePem: stri
   return { id, certificatePem };
 }
 
-export async function issueServerCertificate(inboundId: string, inboundName: string): Promise<IssuedCertificate> {
+/**
+ * The CN of an inbound's server certificate. The generated client profile pins
+ * exactly this name (`verify-x509-name`), so both sides read it from here
+ * instead of hardcoding a value that can drift.
+ */
+export function serverCommonName(inboundName: string): string {
+  return `server-${inboundName}`;
+}
+
+export async function issueServerCertificate(
+  inboundId: string,
+  inboundName: string,
+  domain?: string | null,
+): Promise<IssuedCertificate> {
   const ca = await ensureRootCA();
   const caRow = await q1<{ certificate: string; encrypted_private_key: string }>(
     `SELECT certificate, encrypted_private_key FROM pki_certificates WHERE id = ?`,
@@ -86,7 +99,7 @@ export async function issueServerCertificate(inboundId: string, inboundName: str
   cert.validity.notAfter = new Date();
   cert.validity.notAfter.setFullYear(cert.validity.notBefore.getFullYear() + 5);
   cert.setSubject([
-    { name: "commonName", value: `server-${inboundName}` },
+    { name: "commonName", value: serverCommonName(inboundName) },
     { name: "organizationName", value: "Arvoo" },
   ]);
   cert.setIssuer(caCert.subject.attributes);
@@ -94,7 +107,15 @@ export async function issueServerCertificate(inboundId: string, inboundName: str
     { name: "basicConstraints", cA: false, critical: true },
     { name: "keyUsage", digitalSignature: true, keyEncipherment: true, critical: true },
     { name: "extKeyUsage", serverAuth: true },
-    { name: "subjectAltName", altNames: [{ type: 2, value: inboundName }] },
+    {
+      name: "subjectAltName",
+      // type 2 = DNS. The configured public domain is included when set so the
+      // certificate is valid for the name users actually dial.
+      altNames: [
+        { type: 2, value: inboundName },
+        ...(domain ? [{ type: 2, value: domain }] : []),
+      ],
+    },
   ]);
   cert.sign(caKey, forge.md.sha256.create());
 

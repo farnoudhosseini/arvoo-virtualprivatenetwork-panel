@@ -528,11 +528,17 @@ install_services() {
   step "Installing systemd services"
   install -m 0644 "$INSTALL_ROOT/deploy/arvoo.service" /etc/systemd/system/arvoo.service
   install -m 0644 "$INSTALL_ROOT/deploy/arvoo-agent.service" /etc/systemd/system/arvoo-agent.service
+  # Privileged firewall helper: the panel host applies its own UFW plan through
+  # this oneshot unit, triggered by the path unit watching the request spool.
+  install -m 0644 "$INSTALL_ROOT/deploy/arvoo-ufw-apply.service" /etc/systemd/system/arvoo-ufw-apply.service
+  install -m 0644 "$INSTALL_ROOT/deploy/arvoo-ufw-apply.path" /etc/systemd/system/arvoo-ufw-apply.path
   systemctl daemon-reload
   systemctl enable --quiet arvoo
+  systemctl enable --quiet arvoo-ufw-apply.path 2>/dev/null || true
+  systemctl start arvoo-ufw-apply.path 2>/dev/null || true
   # The node agent is enabled after enrollment (see DEPLOYMENT.md); enabling it
   # before enrollment would crash-loop.
-  ok "arvoo.service installed; arvoo-agent.service installed, not enabled"
+  ok "arvoo.service installed; firewall helper path unit active; arvoo-agent.service installed, not enabled"
 }
 
 start_backend() {
@@ -842,6 +848,14 @@ install_host_tuning() {
   mkdir -p /etc/arvoo /var/lib/arvoo
   chmod 0700 /etc/arvoo /var/lib/arvoo
 
+  # Firewall request spool: the unprivileged API drops a plan here, the root
+  # helper (arvoo-ufw-apply.service) applies it and writes the result back. The
+  # API can only create/modify files in this directory - never run ufw itself.
+  mkdir -p /var/lib/arvoo/firewall-spool
+  chown "$APP_USER:$APP_GROUP" /var/lib/arvoo/firewall-spool
+  chmod 0750 /var/lib/arvoo/firewall-spool
+  ok "firewall spool ready (/var/lib/arvoo/firewall-spool, ${APP_USER}:${APP_GROUP} 0750)"
+
   # IPv4 forwarding must survive a reboot: without it a VPN node silently stops
   # forwarding after the first restart. The agent verifies this value at deploy
   # time instead of relying on a privileged sysctl write per request.
@@ -869,6 +883,8 @@ firewall_rules() {
   }
   ufw allow OpenSSH > /dev/null 2>&1 || ufw allow 22/tcp > /dev/null 2>&1 || true
   ok "ufw active: 80/443 + SSH allowed; PostgreSQL (${PG_PORT}) and the backend (${API_PORT}) stay closed"
+  log "VPN, tunnel and extra ports are opened from the panel (Firewall section: 'Config & Enable UFW' / 'Update UFW'),"
+  log "which computes them from the inbounds and tunnels that actually exist, or from the CLI: arvoo firewall enable"
 }
 
 # ---------------------------------------------------------------------------

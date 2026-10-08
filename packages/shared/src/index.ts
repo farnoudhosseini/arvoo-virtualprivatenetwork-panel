@@ -8,3 +8,5 @@ export * from "./endpoint-sharing";
 export * from "./policy";
 export * from "./quota";
 export * from "./validate";
+export * from "./firewall";
+export * from "./lb";

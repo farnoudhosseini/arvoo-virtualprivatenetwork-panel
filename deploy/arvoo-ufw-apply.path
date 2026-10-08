@@ -1,0 +1,16 @@
+# Watches the firewall request spool and runs the apply helper as root.
+# Installed to /etc/systemd/system by install.sh.
+#
+# A path unit (instead of a long-running daemon) means the privileged part of
+# the platform only ever runs for as long as one apply takes.
+
+[Unit]
+Description=Watch the Arvoo firewall request spool
+Documentation=file:///opt/arvoo/DEPLOYMENT.md
+
+[Path]
+PathExistsGlob=/var/lib/arvoo/firewall-spool/*.request.json
+Unit=arvoo-ufw-apply.service
+
+[Install]
+WantedBy=multi-user.target
