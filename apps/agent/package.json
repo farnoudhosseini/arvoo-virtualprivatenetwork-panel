@@ -1,0 +1,23 @@
+{
+  "name": "@arvoo/agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "arvoo-agent": "./src/cli.ts"
+  },
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "start": "tsx src/index.ts",
+    "build": "esbuild src/index.ts --bundle --platform=node --format=esm --outfile=dist/index.js --banner:js=\"import {createRequire} from 'module';const require=createRequire(import.meta.url);\"",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@arvoo/shared": "*"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.1",
+    "typescript": "^5.6.2",
+    "vitest": "^2.1.1"
+  }
+}

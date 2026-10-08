@@ -1,0 +1,340 @@
+/* Arvoo public endpoint site.
+   Direction-agnostic: every rule uses logical properties, so the same sheet
+   serves the Persian RTL default and the English LTR switch. */
+
+:root {
+  /* Surfaces: cool graphite, so the red reads as a signal rather than decor. */
+  --rack: #0e1116;
+  --panel: #151a21;
+  --panel-2: #1b2129;
+  --line: #232a33;
+  --line-strong: #2f3841;
+
+  --ink: #e8eaed;
+  --mute: #96a0ab;
+  --faint: #6b7783;
+
+  /* Arvoo signal red: reserved for state and one structural accent. */
+  --signal: #e23a2e;
+  --signal-dim: #7a2119;
+  --live: #3fb950;
+  --warn: #d29922;
+
+  --text-face: "Vazirmatn", "Sahel", "IRANSansX", "IRANSans", "Segoe UI", system-ui, -apple-system, sans-serif;
+  --data-face: "IBM Plex Mono", "Cascadia Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+
+  --measure: 68ch;
+  --step--1: clamp(0.78rem, 0.76rem + 0.1vw, 0.84rem);
+  --step-0: clamp(0.94rem, 0.9rem + 0.2vw, 1.02rem);
+  --step-1: clamp(1.15rem, 1.05rem + 0.5vw, 1.35rem);
+  --step-2: clamp(1.5rem, 1.25rem + 1.1vw, 2.1rem);
+  --step-3: clamp(2rem, 1.4rem + 2.6vw, 3.3rem);
+}
+
+/* Optional self-hosted Persian face: drop Vazirmatn.woff2 into ./fonts/ and the
+   stack above picks it up. No third-party request is ever made for fonts. */
+@font-face {
+  font-family: "Vazirmatn";
+  src: url("./fonts/Vazirmatn.woff2") format("woff2-variations");
+  font-weight: 100 900;
+  font-display: swap;
+}
+
+*,
+*::before,
+*::after { box-sizing: border-box; }
+
+html { -webkit-text-size-adjust: 100%; }
+
+body {
+  margin: 0;
+  background: var(--rack);
+  color: var(--ink);
+  font-family: var(--text-face);
+  font-size: var(--step-0);
+  line-height: 1.65;
+  font-feature-settings: "ss01" 1;
+}
+
+/* The left/right spine: the page's one structural accent. In RTL it mirrors
+   automatically because it is a border-inline-start. */
+.rack {
+  min-height: 100vh;
+  border-inline-start: 2px solid var(--signal-dim);
+}
+
+.wrap {
+  max-width: 1080px;
+  margin: 0 auto;
+  padding: clamp(1.25rem, 3vw, 3rem) clamp(1rem, 4vw, 3rem) 4rem;
+}
+
+.skip {
+  position: absolute;
+  inset-inline-start: -9999px;
+}
+.skip:focus {
+  inset-inline-start: 1rem;
+  top: 1rem;
+  z-index: 10;
+  padding: 0.5rem 0.75rem;
+  background: var(--panel-2);
+  border: 1px solid var(--line-strong);
+  border-radius: 4px;
+}
+
+/* ---- Masthead ----------------------------------------------------------- */
+
+.masthead {
+  display: flex;
+  align-items: baseline;
+  gap: 1rem;
+  flex-wrap: wrap;
+  padding-block-end: 1rem;
+  border-block-end: 1px solid var(--line);
+}
+
+.wordmark {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.6rem;
+  font-size: var(--step-1);
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+
+.wordmark b {
+  display: inline-grid;
+  place-items: center;
+  inline-size: 1.6em;
+  block-size: 1.6em;
+  background: var(--signal);
+  color: #fff;
+  border-radius: 3px;
+  font-size: 0.8em;
+}
+
+.wordmark span { color: var(--mute); font-weight: 500; }
+
+.masthead nav {
+  margin-inline-start: auto;
+  display: flex;
+  align-items: center;
+  gap: 1.1rem;
+  font-size: var(--step--1);
+}
+
+.masthead nav a {
+  color: var(--mute);
+  text-decoration: none;
+  padding-block: 0.35rem;
+  border-block-end: 1px solid transparent;
+}
+.masthead nav a:hover,
+.masthead nav a:focus-visible { color: var(--ink); border-block-end-color: var(--signal); }
+
+.lang {
+  font: inherit;
+  font-size: var(--step--1);
+  color: var(--mute);
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  padding: 0.3rem 0.6rem;
+  cursor: pointer;
+}
+.lang:hover { color: var(--ink); border-color: var(--line-strong); }
+
+/* ---- Opening statement -------------------------------------------------- */
+
+.opening {
+  padding-block: clamp(2rem, 6vw, 4.5rem) clamp(1.5rem, 4vw, 3rem);
+  display: grid;
+  gap: clamp(1.5rem, 4vw, 3rem);
+  grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr);
+  align-items: start;
+}
+@media (max-width: 860px) {
+  .opening { grid-template-columns: 1fr; }
+}
+
+.opening h1 {
+  font-size: var(--step-3);
+  line-height: 1.15;
+  letter-spacing: -0.02em;
+  margin: 0 0 1rem;
+  max-width: 20ch;
+}
+
+.opening p {
+  margin: 0 0 0.8rem;
+  color: var(--mute);
+  max-width: var(--measure);
+}
+
+.opening p strong { color: var(--ink); font-weight: 600; }
+
+.facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem 1.6rem;
+  margin-block-start: 1.4rem;
+  padding: 0;
+  list-style: none;
+  font-size: var(--step--1);
+  color: var(--mute);
+}
+.facts li { display: flex; align-items: baseline; gap: 0.45rem; }
+.facts b {
+  font-family: var(--data-face);
+  color: var(--ink);
+  font-weight: 500;
+  /* Isolated as its own run so a value like "41 min ago" can never be
+     reordered against the surrounding Persian sentence. */
+  unicode-bidi: isolate;
+}
+
+/* ---- Status board: the page's one bold element ------------------------- */
+
+.board {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.board header {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.75rem 1rem;
+  border-block-end: 1px solid var(--line);
+  font-size: var(--step--1);
+  color: var(--mute);
+}
+
+.board h2 {
+  font-size: var(--step--1);
+  font-weight: 600;
+  color: var(--ink);
+  margin: 0;
+}
+
+.board .stamp {
+  margin-inline-start: auto;
+  font-family: var(--data-face);
+  font-size: 0.75rem;
+  color: var(--faint);
+  white-space: nowrap;
+}
+
+.board-body { padding: 0.25rem 0; }
+
+.row {
+  display: grid;
+  grid-template-columns: 0.8rem minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.6rem 1rem;
+  border-block-end: 1px solid var(--line);
+  font-size: var(--step--1);
+}
+.row:last-child { border-block-end: 0; }
+
+.row .name { color: var(--ink); }
+.row .name small {
+  display: block;
+  color: var(--faint);
+  font-family: var(--data-face);
+  font-size: 0.72rem;
+  direction: ltr;
+  unicode-bidi: isolate;
+}
+.row .value {
+  font-family: var(--data-face);
+  font-size: 0.78rem;
+  color: var(--mute);
+  text-align: end;
+  white-space: nowrap;
+}
+
+.dot {
+  inline-size: 0.5rem;
+  block-size: 0.5rem;
+  border-radius: 50%;
+  background: var(--faint);
+  box-shadow: 0 0 0 3px transparent;
+}
+.dot.live { background: var(--live); box-shadow: 0 0 0 3px rgb(63 185 80 / 0.12); }
+.dot.warn { background: var(--warn); }
+.dot.down { background: var(--signal); }
+.dot.unknown { background: var(--line-strong); }
+
+.board .note {
+  padding: 0.75rem 1rem;
+  border-block-start: 1px solid var(--line);
+  color: var(--mute);
+  font-size: var(--step--1);
+  background: var(--panel-2);
+}
+.board .note strong { color: var(--ink); font-weight: 600; }
+
+/* Numbers and identifiers must never be reordered by the bidi algorithm. */
+.data, code, .mono {
+  font-family: var(--data-face);
+  unicode-bidi: isolate;
+  direction: ltr;
+}
+
+/* ---- Sections ----------------------------------------------------------- */
+
+section { padding-block: clamp(1.75rem, 4vw, 3rem); border-block-start: 1px solid var(--line); }
+
+section h2 {
+  font-size: var(--step-1);
+  margin: 0 0 0.4rem;
+  letter-spacing: -0.01em;
+}
+
+section > p { margin: 0 0 1.5rem; color: var(--mute); max-width: var(--measure); }
+
+.grid {
+  display: grid;
+  gap: 1.5rem 2rem;
+  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+}
+
+.item h3 { font-size: var(--step-0); margin: 0 0 0.3rem; }
+.item p { margin: 0; color: var(--mute); font-size: var(--step--1); }
+.item ul { margin: 0.5rem 0 0; padding-inline-start: 1.1rem; color: var(--mute); font-size: var(--step--1); }
+
+table.locations { width: 100%; border-collapse: collapse; font-size: var(--step--1); }
+table.locations caption { text-align: start; color: var(--faint); padding-block-end: 0.6rem; }
+table.locations th,
+table.locations td {
+  text-align: start;
+  padding: 0.55rem 0.6rem;
+  border-block-end: 1px solid var(--line);
+}
+table.locations th { color: var(--faint); font-weight: 500; }
+table.locations td.mono { color: var(--mute); }
+
+.missing { color: var(--warn); }
+
+footer {
+  border-block-start: 1px solid var(--line);
+  padding-block: 1.5rem;
+  color: var(--faint);
+  font-size: var(--step--1);
+  display: flex;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+footer a { color: var(--mute); }
+
+a:focus-visible,
+button:focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; }
+
+@media (prefers-reduced-motion: reduce) {
+  * { animation: none !important; transition: none !important; }
+}

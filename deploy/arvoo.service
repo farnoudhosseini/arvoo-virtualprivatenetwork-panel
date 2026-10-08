@@ -1,0 +1,75 @@
+# Arvoo Control Plane - backend service (Ubuntu 24.04 / systemd)
+#
+# Installed to /etc/systemd/system/arvoo.service by install.sh.
+# Do not edit by hand; re-install with: ./install.sh   (or --update / --restart)
+#
+# Security model:
+#   * Runs as the unprivileged `arvoo` system user (no login shell, no sudo).
+#   * Reads secrets from /etc/arvoo.env (mode 0640, root:arvoo). The database
+#     password lives in the EnvironmentFile, never in this unit.
+#   * Listens on 127.0.0.1 only; Nginx is the only public entry point.
+#   * Writes nothing to disk: all state lives in PostgreSQL. ProtectSystem=strict
+#     therefore works without any ReadWritePaths exception (logs go to journald,
+#     the temporary directory is private and writable).
+
+[Unit]
+Description=Arvoo Control Plane API (Fastify + PostgreSQL)
+Documentation=file:///opt/arvoo/DEPLOYMENT.md
+After=network-online.target postgresql.service
+Wants=network-online.target
+Requires=postgresql.service
+# Keep retrying across a slow boot (PostgreSQL needs time to accept connections)
+# instead of failing permanently after the default 5 starts.
+StartLimitIntervalSec=300
+StartLimitBurst=30
+
+[Service]
+Type=simple
+User=arvoo
+Group=arvoo
+WorkingDirectory=/opt/arvoo
+EnvironmentFile=/etc/arvoo.env
+Environment=NODE_ENV=production
+ExecStart=/usr/bin/node /opt/arvoo/apps/api/dist/index.js
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+KillSignal=SIGTERM
+# In production, refuse to start with missing secrets: the app already fails
+# fast; this makes the intent explicit for operators reading the unit.
+SyslogIdentifier=arvoo
+
+# ---- Hardening -------------------------------------------------------------
+# The API needs no privileges, no devices, no kernel access and no writable
+# filesystem beyond its private /tmp.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=true
+RemoveIPC=true
+SystemCallArchitectures=native
+UMask=0027
+# NOTE: MemoryDenyWriteExecute is deliberately NOT used - it breaks the V8 JIT.
+
+# Resource and journal limits; journald handles logs (journalctl -u arvoo).
+StandardOutput=journal
+StandardError=journal
+
+# Out-of-memory protection: restart the process instead of thrashing the host.
+MemoryMax=1G
+
+[Install]
+WantedBy=multi-user.target

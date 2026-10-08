@@ -1,0 +1,215 @@
+/* Arvoo public site.
+ *
+ * Direction: an engineering drawing rather than a landing-page template.
+ * A dark graphite-blue drafting surface, hairline rules that carry structure,
+ * and one warm signal colour used sparingly for actions and live elements.
+ * Typography does the work: large, tightly-set headings against a narrow
+ * measure for body copy. No gradient washes, no card grid, no decorative
+ * numbering, no tracked-out capitals.
+ */
+
+:root {
+  --ink: #0e1621;
+  --ink-2: #131f2e;
+  --rule: #24364b;
+  --rule-strong: #33506f;
+  --text: #e8eef5;
+  --text-dim: #a9b8c8;
+  --signal: #e0a35c;
+  --signal-ink: #1a1206;
+  --focus: #7fd0e8;
+
+  --measure: 68ch;
+  --pad: clamp(1.25rem, 4vw, 3.5rem);
+  --font-sans: "Inter", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", sans-serif;
+  --font-fa: "Vazirmatn", "IRANSans", "Segoe UI", Tahoma, system-ui, sans-serif;
+  --font-mono: ui-monospace, "SFMono-Regular", "Cascadia Mono", "JetBrains Mono", Menlo, monospace;
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+
+html { -webkit-text-size-adjust: 100%; }
+
+body {
+  margin: 0;
+  background: var(--ink);
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-size: clamp(1rem, 0.96rem + 0.2vw, 1.0625rem);
+  line-height: 1.65;
+  letter-spacing: 0.001em;
+}
+
+html[lang="fa"] body { font-family: var(--font-fa); line-height: 1.85; }
+
+h1, h2, h3 { line-height: 1.15; margin: 0 0 0.6em; font-weight: 600; }
+html[lang="fa"] h1, html[lang="fa"] h2, html[lang="fa"] h3 { line-height: 1.45; }
+
+h1 { font-size: clamp(2.4rem, 1.4rem + 4.4vw, 4.4rem); letter-spacing: -0.03em; max-width: 22ch; }
+h2 { font-size: clamp(1.5rem, 1.1rem + 1.4vw, 2.1rem); letter-spacing: -0.02em; }
+h3 { font-size: 1.0625rem; letter-spacing: -0.01em; }
+
+p { margin: 0 0 1em; max-width: var(--measure); }
+a { color: inherit; }
+
+.skip {
+  position: absolute; inset-inline-start: -9999px;
+  background: var(--signal); color: var(--signal-ink);
+  padding: 0.6rem 1rem; z-index: 20;
+}
+.skip:focus { inset-inline-start: 0; top: 0; }
+
+:focus-visible { outline: 2px solid var(--focus); outline-offset: 3px; }
+
+/* ---------------------------------------------------------------- top bar */
+
+.topbar {
+  position: sticky; top: 0; z-index: 10;
+  display: flex; align-items: center; gap: 1.5rem;
+  padding: 0.9rem var(--pad);
+  background: color-mix(in srgb, var(--ink) 88%, transparent);
+  backdrop-filter: blur(8px);
+  border-bottom: 1px solid var(--rule);
+}
+
+.brand { display: flex; align-items: center; gap: 0.6rem; text-decoration: none; }
+.brand-mark {
+  width: 18px; height: 18px;
+  border: 1.5px solid var(--signal);
+  border-radius: 2px;
+  box-shadow: inset 0 0 0 3px var(--ink), inset 0 0 0 4.5px var(--rule-strong);
+}
+.brand-name { font-weight: 600; letter-spacing: -0.02em; }
+
+.topnav {
+  margin-inline-start: auto;
+  display: flex; gap: 1.35rem; flex-wrap: wrap;
+  font-size: 0.9375rem;
+}
+.topnav a {
+  color: var(--text-dim); text-decoration: none;
+  padding-block: 0.25rem;
+  border-bottom: 1px solid transparent;
+}
+.topnav a:hover { color: var(--text); border-bottom-color: var(--rule-strong); }
+
+.lang {
+  font: inherit; font-size: 0.875rem;
+  background: transparent; color: var(--text);
+  border: 1px solid var(--rule-strong); border-radius: 2px;
+  padding: 0.4rem 0.75rem; cursor: pointer;
+}
+.lang:hover { border-color: var(--signal); color: var(--signal); }
+
+/* ------------------------------------------------------------------- hero */
+
+.hero {
+  display: grid;
+  grid-template-columns: minmax(0, 1.05fr) minmax(0, 0.95fr);
+  gap: clamp(1.5rem, 5vw, 4.5rem);
+  align-items: center;
+  padding: clamp(2.5rem, 7vw, 5.5rem) var(--pad) clamp(2rem, 5vw, 4rem);
+  max-width: 1240px; margin-inline: auto;
+}
+
+.lede { font-size: clamp(1.0625rem, 1rem + 0.5vw, 1.25rem); color: var(--text-dim); max-width: 46ch; }
+
+.hero-actions { display: flex; gap: 0.75rem; flex-wrap: wrap; margin-top: 1.75rem; }
+
+.button {
+  display: inline-block;
+  font-size: 0.9375rem; font-weight: 500;
+  text-decoration: none;
+  padding: 0.7rem 1.15rem;
+  border: 1px solid var(--signal); border-radius: 2px;
+  background: var(--signal); color: var(--signal-ink);
+}
+.button.ghost { background: transparent; color: var(--text); border-color: var(--rule-strong); }
+.button.ghost:hover { border-color: var(--signal); color: var(--signal); }
+.button:hover { background: color-mix(in srgb, var(--signal) 84%, white); }
+
+.schematic { margin: 0; }
+.schematic svg { width: 100%; height: auto; display: block; }
+.schematic figcaption { color: var(--text-dim); font-size: 0.875rem; margin-top: 0.9rem; max-width: 42ch; }
+
+.edge { stroke: var(--rule-strong); stroke-width: 1.25; }
+.edge.muted { stroke-dasharray: 3 5; }
+.node rect { stroke: var(--text-dim); stroke-width: 1.25; fill: var(--ink-2); }
+.node.core rect { stroke: var(--signal); fill: color-mix(in srgb, var(--signal) 12%, var(--ink-2)); }
+.rules line { stroke: var(--rule); stroke-width: 1; }
+
+/* ------------------------------------------------------------------ bands */
+
+.band {
+  padding: clamp(2.5rem, 6vw, 4.5rem) var(--pad);
+  border-top: 1px solid var(--rule);
+  max-width: 1240px; margin-inline: auto;
+}
+.band.alt { background: var(--ink-2); max-width: none; }
+.band.alt > * { max-width: 1240px; margin-inline: auto; }
+.wide { max-width: var(--measure); color: var(--text-dim); }
+.wide.small { margin-top: 1.5rem; }
+.wide.small + .code { margin-top: 0.5rem; }
+
+.services { list-style: none; margin: 0; padding: 0; display: grid; gap: 0; }
+.services li {
+  display: grid; grid-template-columns: minmax(14rem, 22rem) minmax(0, 1fr);
+  gap: 1rem 2.5rem;
+  padding: 1.15rem 0;
+  border-top: 1px solid var(--rule);
+}
+.services li:first-child { border-top-color: var(--rule-strong); }
+.services h3 { margin: 0; }
+.services p { margin: 0; color: var(--text-dim); }
+
+.platform { display: grid; grid-template-columns: minmax(0, 1fr) minmax(16rem, 24rem); gap: clamp(1.5rem, 5vw, 4rem); }
+.steps ol { list-style: none; margin: 0; padding: 0; }
+.steps li { padding: 1.15rem 0; border-top: 1px solid var(--rule); }
+.steps h3 { margin-bottom: 0.35rem; }
+.steps p { margin: 0; color: var(--text-dim); }
+
+.note { border-inline-start: 2px solid var(--signal); padding-inline-start: 1.25rem; align-self: start; }
+.note h3 { color: var(--signal); }
+.note p { color: var(--text-dim); margin: 0; }
+
+.docs { display: grid; grid-template-columns: repeat(auto-fit, minmax(18rem, 1fr)); gap: 2rem; margin-top: 1.5rem; }
+.docs h3 { color: var(--text-dim); margin-bottom: 0.5rem; }
+
+.code {
+  font-family: var(--font-mono);
+  font-size: 0.875rem; line-height: 1.75;
+  background: color-mix(in srgb, var(--ink) 70%, black);
+  border: 1px solid var(--rule);
+  border-radius: 2px;
+  padding: 0.9rem 1rem;
+  overflow-x: auto;
+  color: var(--text);
+  white-space: pre;
+}
+html[lang="fa"] .code { direction: ltr; text-align: left; }
+
+.contact-line { margin-top: 1.5rem; }
+
+/* ----------------------------------------------------------------- footer */
+
+.footer {
+  border-top: 1px solid var(--rule);
+  padding: clamp(1.75rem, 4vw, 3rem) var(--pad) 3.5rem;
+  max-width: 1240px; margin-inline: auto;
+  color: var(--text-dim); font-size: 0.9375rem;
+}
+.footer .fine { font-size: 0.875rem; max-width: 60ch; }
+
+/* -------------------------------------------------------------- responsive */
+
+@media (max-width: 900px) {
+  .hero { grid-template-columns: minmax(0, 1fr); }
+  .schematic { order: -1; }
+  .platform { grid-template-columns: minmax(0, 1fr); }
+  .services li { grid-template-columns: minmax(0, 1fr); gap: 0.35rem; }
+  .topnav { display: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * { animation: none !important; transition: none !important; }
+}

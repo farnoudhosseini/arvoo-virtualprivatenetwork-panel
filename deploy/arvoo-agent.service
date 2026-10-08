@@ -1,0 +1,85 @@
+# Arvoo Node Agent service (Ubuntu 24.04 / systemd)
+#
+# Runs on a MANAGED VPN NODE (not required on a panel-only host). The agent
+# executes privileged Linux networking work on behalf of the control plane:
+#   * iproute2  - create/verify GRE interfaces and routes
+#   * iptables  - NAT/MASQUERADE for the VPN subnet
+#   * sysctl    - only when net.ipv4.ip_forward is not already enabled
+#                 (install.sh sets it persistently in /etc/sysctl.d/99-arvoo.conf)
+#   * OpenVPN   - write server configs + PKI material under /etc/arvoo/openvpn
+#   * systemd   - register/start/stop arvoo-openvpn@<inbound> units
+#
+# Privilege model (least privilege that actually works):
+#   * The agent is the ONLY Arvoo component that runs privileged; the control
+#     plane API (arvoo.service) is completely unprivileged and never executes
+#     network commands itself - it queues typed operations and the agent picks
+#     them up over HTTPS.
+#   * Commands are executed with execFile + an argv array (no shell), so the
+#     control plane can never inject a command line.
+#   * The service is sandboxed to the exact paths it must modify. Everything
+#     else on the filesystem is read-only, home directories and devices are
+#     hidden and /tmp is private.
+#   * It runs as root because `systemctl`, `/proc/sys` writes and netfilter
+#     (iptables) administration genuinely require it; this is the documented
+#     exception to the "no root" rule, isolated in its own unit and its own
+#     systemd sandbox.
+#
+# Install on a node AFTER the agent is enrolled:
+#   /opt/arvoo/apps/agent/dist/index.js enroll <token>   (one-time)
+#   systemctl enable --now arvoo-agent
+#
+# State file: /var/lib/arvoo/agent-state.json (holds the node secret).
+
+[Unit]
+Description=Arvoo Node Agent (heartbeat + operations executor)
+Documentation=file:///opt/arvoo/DEPLOYMENT.md
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=30
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/arvoo/apps/agent
+EnvironmentFile=-/etc/arvoo/agent.env
+ExecStart=/usr/bin/node /opt/arvoo/apps/agent/dist/index.js
+Restart=always
+RestartSec=10
+TimeoutStopSec=30
+SyslogIdentifier=arvoo-agent
+
+# ---- Hardening -------------------------------------------------------------
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+# Read-only root filesystem; the agent may only write where it genuinely must:
+#   /etc/arvoo          OpenVPN configs, PKI material, GRE persistence, node secret
+#   /etc/systemd/system arvoo-openvpn@<inbound>.service units
+#   /var/lib/arvoo      agent enrollment state
+#   /run                systemd/dbus sockets and runtime state
+ProtectSystem=strict
+ReadWritePaths=/etc/arvoo /etc/systemd/system /var/lib/arvoo /run
+ProtectHome=true
+# Required for `sysctl -w net.ipv4.ip_forward=1`; the value is also applied
+# persistently at install time, so this is only a fallback path.
+ProtectKernelTunables=false
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+LockPersonality=true
+RemoveIPC=true
+SystemCallArchitectures=native
+UMask=0077
+# NOTE: MemoryDenyWriteExecute is deliberately NOT used - it breaks the V8 JIT.
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

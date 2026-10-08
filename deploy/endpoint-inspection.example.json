@@ -1,0 +1,71 @@
+{
+  "_comment": "SAMPLE ONLY — shaped like the output of scripts/endpoint-inspect.sh, but not measured on any real server. Replace it with a real inspection before running scripts/endpoint-share.sh.",
+  "generatedAt": "2026-10-08T00:00:00Z",
+  "host": "sample-node",
+  "kernel": "6.8.0-45-generic",
+  "note": "Classification is heuristic and low-confidence by default: confirm protocol, TLS ownership and multiplexing in each service own configuration before acting on it.",
+  "inbounds": [
+    {
+      "name": "IR-01/xray:443",
+      "protocol": "vless",
+      "transport": "tcp",
+      "tls": "passthrough-sni",
+      "multiplexing": "none",
+      "ports": [443],
+      "evidence": ["ss: tcp 0.0.0.0:443 users:((\"xray\"))", "xray config: reality dest + privateKey; no fallback configured"],
+      "confidence": "medium"
+    },
+    {
+      "name": "IR-01/trojan:8443",
+      "protocol": "trojan",
+      "transport": "tcp",
+      "tls": "terminated-by-inbound",
+      "multiplexing": "inbound-fallback",
+      "ports": [8443],
+      "evidence": ["ss: tcp 0.0.0.0:8443 users:((\"trojan-go\"))", "config: fallback_addr 127.0.0.1:8000"],
+      "confidence": "medium"
+    },
+    {
+      "name": "IR-01/wireguard:51820",
+      "protocol": "wireguard",
+      "transport": "udp",
+      "tls": "none",
+      "multiplexing": "none",
+      "ports": [51820],
+      "evidence": ["ss: udp 0.0.0.0:51820"],
+      "confidence": "high"
+    },
+    {
+      "name": "DE-01/openvpn:1194",
+      "protocol": "openvpn",
+      "transport": "both",
+      "tls": "terminated-by-inbound",
+      "multiplexing": "none",
+      "ports": [1194],
+      "evidence": ["ss: udp 0.0.0.0:1194", "ss: tcp 0.0.0.0:1194"],
+      "confidence": "high"
+    },
+    {
+      "name": "DE-01/gre:ir-de",
+      "protocol": "gre",
+      "transport": "tcp",
+      "tls": "none",
+      "multiplexing": "none",
+      "ports": [],
+      "rawIpProtocol": true,
+      "evidence": ["ip -d link show gre-ir-de (ip protocol 47, no socket)"],
+      "confidence": "high"
+    },
+    {
+      "name": "NL-01/nginx:80",
+      "protocol": "http",
+      "transport": "tcp",
+      "tls": "terminated-by-proxy",
+      "multiplexing": "http-vhost",
+      "ports": [80],
+      "alreadyBehindProxy": true,
+      "evidence": ["ss: tcp 0.0.0.0:80 users:((\"nginx\"))"],
+      "confidence": "high"
+    }
+  ]
+}

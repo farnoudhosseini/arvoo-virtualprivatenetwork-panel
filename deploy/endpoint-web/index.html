@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>آروو — زیرساخت شبکه و ترانزیت</title>
+<meta name="description" content="Arvoo operates relay and transit infrastructure: encrypted paths between Iran and Europe, a private control plane, and operator-grade operations.">
+<meta name="color-scheme" content="dark">
+<meta name="robots" content="index,follow">
+<link rel="stylesheet" href="./styles.css">
+<!-- No third-party requests, no analytics, no fonts loaded from a CDN. -->
+</head>
+<body>
+<div class="rack">
+<a class="skip" href="#main" data-fa="رفتن به محتوا" data-en="Skip to content">رفتن به محتوا</a>
+
+<div class="wrap">
+  <header class="masthead">
+    <span class="wordmark"><b>A</b><span data-fa="آروو" data-en="Arvoo">آروو</span></span>
+    <nav aria-label="Primary">
+      <a href="#capability" data-fa="توانمندی‌ها" data-en="Capability">توانمندی‌ها</a>
+      <a href="#locations" data-fa="موقعیت‌ها" data-en="Locations">موقعیت‌ها</a>
+      <a href="#security" data-fa="امنیت" data-en="Security">امنیت</a>
+      <a href="#support" data-fa="پشتیبانی" data-en="Support">پشتیبانی</a>
+      <button class="lang" id="lang" type="button" aria-live="polite">EN</button>
+    </nav>
+  </header>
+
+  <main id="main">
+    <div class="opening">
+      <div>
+        <h1 data-fa="زیرساخت شبکه، بدون واسطه‌های اضافه." data-en="Network infrastructure, with nothing in the middle.">
+          زیرساخت شبکه، بدون واسطه‌های اضافه.
+        </h1>
+        <p data-fa="آروو مسیرهای رمزنگاری‌شده بین ایران و اروپا را می‌سازد و اداره می‌کند: نودهای رله اختصاصی، تونل‌های GRE با پوشش IPsec، و یک کنترل‌پلین خصوصی که همه‌ی تغییرات را از روی وضعیت واقعی سیستم گزارش می‌دهد."
+           data-en="Arvoo builds and operates encrypted paths between Iran and Europe: dedicated relay nodes, GRE tunnels with IPsec protection, and a private control plane that reports every change from real system state.">
+          آروو مسیرهای رمزنگاری‌شده بین ایران و اروپا را می‌سازد و اداره می‌کند: نودهای رله اختصاصی، تونل‌های GRE با پوشش IPsec، و یک کنترل‌پلین خصوصی که همه‌ی تغییرات را از روی وضعیت واقعی سیستم گزارش می‌دهد.
+        </p>
+        <p data-fa="این سایت همان نقطه‌ی اشتراکی است که در کنار سرویس‌های موجود روی همین سرور اجرا می‌شود؛ در این صفحه هیچ ورود، هیچ فرم و هیچ اطلاعاتی از شما ثبت نمی‌شود."
+           data-en="This page is the shared endpoint that runs beside the services already on this server. There is no login, no form, and nothing about you is recorded here.">
+          این سایت همان نقطه‌ی اشتراکی است که در کنار سرویس‌های موجود روی همین سرور اجرا می‌شود؛ در این صفحه هیچ ورود، هیچ فرم و هیچ اطلاعاتی از شما ثبت نمی‌شود.
+        </p>
+
+        <ul class="facts">
+          <li><span data-fa="نقاط حضور:" data-en="Locations:">نقاط حضور:</span> <b id="fact-locations">—</b></li>
+          <li><span data-fa="گواهی TLS:" data-en="TLS certificate:">گواهی TLS:</span> <b id="fact-tls">—</b></li>
+          <li><span data-fa="پنجره‌ی گزارش:" data-en="Reported at:">پنجره‌ی گزارش:</span> <b id="fact-stamp">—</b></li>
+        </ul>
+      </div>
+
+      <aside class="board" aria-labelledby="board-title">
+        <header>
+          <h2 id="board-title" data-fa="وضعیت همین لحظه" data-en="Current status">وضعیت همین لحظه</h2>
+          <span class="stamp" id="board-stamp">—</span>
+        </header>
+        <div class="board-body" id="board-body">
+          <div class="row">
+            <span class="dot unknown" aria-hidden="true"></span>
+            <span class="name" data-fa="در حال خواندن وضعیت…" data-en="Reading status…">در حال خواندن وضعیت…</span>
+            <span class="value">—</span>
+          </div>
+        </div>
+        <p class="note" id="board-note" data-fa="وضعیت از فایل status.json همان سرور خوانده می‌شود؛ اگر داده‌ای موجود نباشد، همین جا صریح گفته می‌شود و هیچ‌چیز سبز نمایش داده نمی‌شود."
+           data-en="Status is read from this server's own status.json. If data is missing it is stated here plainly — nothing is shown green without evidence.">
+          وضعیت از فایل status.json همان سرور خوانده می‌شود؛ اگر داده‌ای موجود نباشد، همین جا صریح گفته می‌شود و هیچ‌چیز سبز نمایش داده نمی‌شود.
+        </p>
+      </aside>
+    </div>
+
+    <section id="capability">
+      <h2 data-fa="آنچه فراهم می‌کنیم" data-en="What we provide">آنچه فراهم می‌کنیم</h2>
+      <p data-fa="چهار چیز، بدون ادعای اضافه."
+         data-en="Four things, without extra claims.">چهار چیز، بدون ادعای اضافه.</p>
+      <div class="grid">
+        <div class="item">
+          <h3 data-fa="رله‌ی اختصاصی" data-en="Dedicated relays">رله‌ی اختصاصی</h3>
+          <p data-fa="هر نود با ظرفیت اعلام‌شده و پهنای‌باند مشخص؛ تخصیص بر اساس ظرفیت و سلامت واقعی نود انجام می‌شود، نه به‌صورت گردشی کورکورانه."
+             data-en="Every node carries a declared session capacity and bandwidth; placement follows real capacity and health rather than blind round-robin.">
+            هر نود با ظرفیت اعلام‌شده و پهنای‌باند مشخص؛ تخصیص بر اساس ظرفیت و سلامت واقعی نود انجام می‌شود، نه به‌صورت گردشی کورکورانه.
+          </p>
+        </div>
+        <div class="item">
+          <h3 data-fa="انتقال رمزنگاری‌شده" data-en="Encrypted transport">انتقال رمزنگاری‌شده</h3>
+          <ul>
+            <li data-fa="GRE با پوشش IPsec (رمزنگاری‌شده)" data-en="GRE over IPsec (encrypted)">GRE با پوشش IPsec (رمزنگاری‌شده)</li>
+            <li data-fa="GRE با FOU برای محیط‌های محدود" data-en="GRE over FOU for constrained networks">GRE با FOU برای محیط‌های محدود</li>
+            <li data-fa="GRE خام؛ بدون رمزنگاری و به‌همین‌دلیل فقط جاییکه امنیت لازم نیست" data-en="Native GRE: unencrypted, offered only where encryption is not required">GRE خام؛ بدون رمزنگاری و به‌همین‌دلیل فقط جاییکه امنیت لازم نیست</li>
+          </ul>
+        </div>
+        <div class="item">
+          <h3 data-fa="کنترل‌پلین خصوصی" data-en="Private control plane">کنترل‌پلین خصوصی</h3>
+          <p data-fa="پنل و ایجنت روی کانال خودشان کار می‌کنند و مسیر داده‌ی کاربران هرگز از سرور پنل عبور نمی‌کند."
+             data-en="The panel and its agents use their own channel; user data paths never traverse the panel server.">
+            پنل و ایجنت روی کانال خودشان کار می‌کنند و مسیر داده‌ی کاربران هرگز از سرور پنل عبور نمی‌کند.
+          </p>
+        </div>
+        <div class="item">
+          <h3 data-fa="بهره‌برداری" data-en="Operations">بهره‌برداری</h3>
+          <p data-fa="هر تغییر عملیاتی ثبت می‌شود: چه کسی، چه زمانی، روی کدام منبع، با چه نتیجه‌ای. هشدارها و پشتیبان‌گیری بخشی از سیستم‌اند، نه افزودنی."
+             data-en="Every operational change is recorded: who, when, on which resource, with which result. Alerts and backups are part of the system, not add-ons.">
+            هر تغییر عملیاتی ثبت می‌شود: چه کسی، چه زمانی، روی کدام منبع، با چه نتیجه‌ای. هشدارها و پشتیبان‌گیری بخشی از سیستم‌اند، نه افزودنی.
+          </p>
+        </div>
+      </div>
+    </section>
+
+    <section id="locations">
+      <h2 data-fa="موقعیت‌ها" data-en="Locations">موقعیت‌ها</h2>
+      <p data-fa="فهرست زیر از همان فایل وضعیت خوانده می‌شود؛ اگر خالی باشد یعنی داده‌ای برای نمایش وجود ندارد."
+         data-en="This list comes from the same status file. If it is empty, there is simply no data to show.">
+        فهرست زیر از همان فایل وضعیت خوانده می‌شود؛ اگر خالی باشد یعنی داده‌ای برای نمایش وجود ندارد.
+      </p>
+      <table class="locations">
+        <caption data-fa="نودهای ثبت‌شده و وضعیت شنود آن‌ها" data-en="Registered nodes and their listener state">نودهای ثبت‌شده و وضعیت شنود آن‌ها</caption>
+        <thead>
+          <tr>
+            <th data-fa="نود" data-en="Node">نود</th>
+            <th data-fa="موقعیت" data-en="Location">موقعیت</th>
+            <th data-fa="نقش" data-en="Role">نقش</th>
+            <th data-fa="وضعیت" data-en="Status">وضعیت</th>
+          </tr>
+        </thead>
+        <tbody id="locations-body">
+          <tr><td colspan="4" class="missing" data-fa="داده‌ای در status.json نیست" data-en="No node data in status.json">داده‌ای در status.json نیست</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section id="security">
+      <h2 data-fa="امنیت و شفافیت" data-en="Security and transparency">امنیت و شفافیت</h2>
+      <p data-fa="هرچه در این صفحه آمده، همین است؛ چیز بیشتری ادعا نمی‌شود."
+         data-en="What follows is the whole claim — nothing more is asserted.">هرچه در این صفحه آمده، همین است؛ چیز بیشتری ادعا نمی‌شود.</p>
+      <div class="grid">
+        <div class="item">
+          <h3 data-fa="بدون جمع‌آوری اطلاعات" data-en="No data collection">بدون جمع‌آوری اطلاعات</h3>
+          <p data-fa="این سایت هیچ فرم، ورود، کوکی ردیابی، اسکریپت آماری و درخواست خارجی ندارد."
+             data-en="This site has no form, no login, no tracking cookie, no analytics script and no external request.">
+            این سایت هیچ فرم، ورود، کوکی ردیابی، اسکریپت آماری و درخواست خارجی ندارد.
+          </p>
+        </div>
+        <div class="item">
+          <h3 data-fa="TLS دست‌نخورده" data-en="TLS left intact">TLS دست‌نخورده</h3>
+          <p data-fa="در حالت اشتراکی، TLS سرویس موجود بازنویسی نمی‌شود؛ یا از مکانیزم خود همان سرویس استفاده می‌شود یا ترافیک TLS بدون پایان‌دادن عبور می‌کند."
+             data-en="In a shared setup, the existing service's TLS is never re-terminated: either the service's own mechanism is used, or TLS is passed through untouched.">
+            در حالت اشتراکی، TLS سرویس موجود بازنویسی نمی‌شود؛ یا از مکانیزم خود همان سرویس استفاده می‌شود یا ترافیک TLS بدون پایان‌دادن عبور می‌کند.
+          </p>
+        </div>
+        <div class="item">
+          <h3 data-fa="کمترین دسترسی" data-en="Least privilege">کمترین دسترسی</h3>
+          <p data-fa="سرویس وب فقط روی لوپ‌بک گوش می‌دهد و به سرویس‌های شبکه دسترسی ندارد؛ جهت اشتراک یک‌طرفه است."
+             data-en="The web service listens on loopback only and has no access to the network services; the sharing relationship is one-way.">
+            سرویس وب فقط روی لوپ‌بک گوش می‌دهد و به سرویس‌های شبکه دسترسی ندارد؛ جهت اشتراک یک‌طرفه است.
+          </p>
+        </div>
+        <div class="item">
+          <h3 data-fa="قابل بازگشت" data-en="Reversible">قابل بازگشت</h3>
+          <p data-fa="هر تغییری در مسیر اشتراک با نسخه‌ی پشتیبان همراه است و اگر اعتبارسنجی رد شود، به‌صورت خودکار به حالت قبل برمی‌گردد."
+             data-en="Any change on the sharing path ships with a timestamped backup and reverts automatically when validation fails.">
+            هر تغییری در مسیر اشتراک با نسخه‌ی پشتیبان همراه است و اگر اعتبارسنجی رد شود، به‌صورت خودکار به حالت قبل برمی‌گردد.
+          </p>
+        </div>
+      </div>
+    </section>
+
+    <section id="support">
+      <h2 data-fa="پشتیبانی و مستندات" data-en="Support and documentation">پشتیبانی و مستندات</h2>
+      <p data-fa="برای مسائل عملیاتی، مسیر پشتیبانی و مستندات از فایل وضعیت خوانده می‌شود تا در یک نقطه نگهداری شود."
+         data-en="Operational contact details and the documentation path are read from the status file, so they are maintained in one place.">
+        برای مسائل عملیاتی، مسیر پشتیبانی و مستندات از فایل وضعیت خوانده می‌شود تا در یک نقطه نگهداری شود.
+      </p>
+      <div class="grid">
+        <div class="item">
+          <h3 data-fa="تماس" data-en="Contact">تماس</h3>
+          <p id="support-contact" class="mono missing" data-fa="در status.json تعریف نشده" data-en="Not defined in status.json">در status.json تعریف نشده</p>
+        </div>
+        <div class="item">
+          <h3 data-fa="مستندات" data-en="Documentation">مستندات</h3>
+          <p id="support-docs" class="mono missing" data-fa="در status.json تعریف نشده" data-en="Not defined in status.json">در status.json تعریف نشده</p>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <span data-fa="آروو — زیرساخت شبکه و ترانزیت" data-en="Arvoo — network infrastructure and transit">آروو — زیرساخت شبکه و ترانزیت</span>
+    <span class="mono" id="footer-stamp">—</span>
+  </footer>
+</div>
+</div>
+<script src="./app.js"></script>
+</body>
+</html>

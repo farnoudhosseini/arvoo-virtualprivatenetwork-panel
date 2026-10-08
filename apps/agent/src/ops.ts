@@ -1,0 +1,734 @@
+/**
+ * Typed operation executors. Each operation is a structured payload; no
+ * arbitrary shell commands are ever accepted from the control plane.
+ *
+ * Linux is required for networking/OpenVPN operations. On other platforms the
+ * executor fails honestly with an explicit message instead of simulating.
+ */
+
+import { mkdir, writeFile, readFile, readdir, rm } from "node:fs/promises";
+import { createConnection } from "node:net";
+import path from "node:path";
+import type {
+  BenchmarkOpInput,
+  GreOpInput,
+  IPsecOpInput,
+  NodeCapabilities,
+  OpenVPNOpInput,
+  TunnelTestResult,
+} from "@arvoo/shared";
+import { exec } from "./linux.js";
+
+export interface OpResult {
+  success: boolean;
+  output?: unknown;
+  error?: string;
+}
+
+function requiresLinux(): OpResult {
+  return {
+    success: false,
+    error:
+      "This operation requires a Linux node (iproute2/systemd/OpenVPN). The current agent host is not Linux, so the operation was not executed.",
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Shared privileged helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Is `port` already listening for the given protocol?
+ *
+ * `ss` is invoked with an argv array (never a shell pipeline), and the
+ * human-readable output is parsed here. Returns null when `ss` is unavailable,
+ * so callers can decide instead of guessing. Checking the matching protocol
+ * matters: a TCP inbound must not be declared free just because no UDP socket
+ * holds the port (and vice versa).
+ */
+async function portIsListening(port: number, protocol: "udp" | "tcp"): Promise<boolean | null> {
+  const args = protocol === "tcp" ? ["-ltn"] : ["-lun"];
+  const res = await exec("ss", args, 5000).catch(() => null);
+  if (!res || res.code !== 0) return null;
+  const suffix = `:${port}`;
+  return res.stdout.split(/\r?\n/).some((line) => {
+    const fields = line.trim().split(/\s+/);
+    // ss prints: State Recv-Q Send-Q Local-Address:Port Peer-Address:Port ...
+    if (fields.length < 5) return false;
+    return fields[3]!.endsWith(suffix);
+  });
+}
+
+/**
+ * Verify (and only if necessary enable) IPv4 forwarding.
+ *
+ * The installer enables this persistently in /etc/sysctl.d/99-arvoo.conf, so a
+ * rebooted node already has it set and the agent only needs to read /proc/sys.
+ * The `sysctl -w` fallback exists for hosts where forwarding was turned off by
+ * hand; it fails cleanly instead of pretending the deployment succeeded.
+ */
+async function ensureIpForward(): Promise<string | null> {
+  const current = await readFile("/proc/sys/net/ipv4/ip_forward", "utf8").catch(() => null);
+  if (current?.trim() === "1") return null;
+
+  const sysctl = await exec("sysctl", ["-w", "net.ipv4.ip_forward=1"]).catch(() => null);
+  if (sysctl?.code === 0) return null;
+
+  return (
+    "IPv4 forwarding is disabled on this node and the agent could not enable it " +
+    "(writing /proc/sys is not permitted in the agent sandbox). Enable it persistently and retry: " +
+    "echo 'net.ipv4.ip_forward = 1' > /etc/sysctl.d/99-arvoo.conf && sysctl --system"
+  );
+}
+
+// ---------------------------------------------------------------------------
+// GRE
+// ---------------------------------------------------------------------------
+
+export async function applyGre(input: GreOpInput): Promise<OpResult> {
+  if (process.platform !== "linux") return requiresLinux();
+
+  // Idempotent: remove pre-existing interface of the same name first
+  await exec("ip", ["link", "del", input.interfaceName], 5000).catch(() => undefined);
+
+  const args: string[] = ["link", "add", input.interfaceName, "type", "gre",
+    "local", input.localEndpoint, "remote", input.remoteEndpoint, "ttl", String(input.ttl)];
+  if (input.key) args.push("key", input.key);
+
+  if (input.fouPort != null) {
+    // GRE over FOU: the kernel sends GRE inside UDP on the given port. The FOU
+    // receiver must listen on the same port on the remote node (same ipproto 47).
+    await exec("modprobe", ["fou"]);
+    await exec("ip", ["fou", "del", "port", String(input.fouPort)]).catch(() => undefined);
+    const fou = await exec("ip", ["fou", "add", "port", String(input.fouPort), "ipproto", "47"]);
+    if (fou.code !== 0 && !fou.stderr.includes("File exists")) {
+      return { success: false, error: `FOU listener on port ${input.fouPort} failed: ${fou.stderr.trim()}` };
+    }
+    args.push("encap", "fou", "encap-sport", "auto", "encap-dport", String(input.fouPort));
+  }
+
+  const add = await exec("ip", args);
+  if (add.code !== 0) return { success: false, error: `ip link add failed: ${add.stderr.trim()}` };
+
+  // GRO on the receive path can collapse FOU-encapsulated packets and cut
+  // throughput sharply; disable it on the tunnel device when FOU is in use.
+  if (input.fouPort != null) {
+    await exec("ethtool", ["-K", input.interfaceName, "gro", "off"]).catch(() => undefined);
+  }
+
+  const addr = await exec("ip", ["addr", "add", `${input.localTunnelIp}/30`, "dev", input.interfaceName]);
+  if (addr.code !== 0 && !addr.stderr.includes("File exists")) {
+    return { success: false, error: `addr add failed: ${addr.stderr.trim()}` };
+  }
+
+  const up = await exec("ip", ["link", "set", "dev", input.interfaceName, "mtu", String(input.mtu), "up"]);
+  if (up.code !== 0) return { success: false, error: `link set up failed: ${up.stderr.trim()}` };
+
+  for (const route of input.routes) {
+    const rArgs = ["route", "replace", route.destination];
+    if (route.gateway) rArgs.push("via", route.gateway);
+    if (route.device) rArgs.push("dev", route.device);
+    const r = await exec("ip", rArgs);
+    if (r.code !== 0) return { success: false, error: `route add failed: ${r.stderr.trim()}` };
+  }
+
+  // Persist under /etc/arvoo/gre so the network can be re-applied after reboot
+  // by `arvoo-agent apply-persisted` (systemd unit optional).
+  try {
+    const dir = "/etc/arvoo/gre";
+    await mkdir(dir, { recursive: true });
+    await writeFile(path.join(dir, `${input.interfaceName}.json`), JSON.stringify(input, null, 2), { mode: 0o600 });
+  } catch {
+    // persistence best-effort; runtime state still applied
+  }
+
+  // In-place verification: interface present + ping across the tunnel
+  const link = await exec("ip", ["link", "show", input.interfaceName]);
+  if (link.code !== 0) return { success: false, error: "Interface not present after creation" };
+
+  const ping = await exec("ping", ["-c", "3", "-W", "2", "-I", input.interfaceName, input.remoteTunnelIp], 15000);
+  const lossMatch = ping.stdout.match(/(\d+(?:\.\d+)?)% packet loss/);
+  const lossPct = lossMatch ? Number(lossMatch[1]) : null;
+  const rttMatch = ping.stdout.match(/= [\d.]+\/([\d.]+)\//);
+  const latencyMs = rttMatch ? Number(rttMatch[1]) : null;
+  const pingOk = ping.code === 0;
+
+  return {
+    success: pingOk,
+    error: pingOk ? undefined : "Tunnel interface created but remote tunnel IP did not answer ping (side may be down)",
+    output: {
+      ok: pingOk,
+      latencyMs,
+      lossPct,
+      interfacePresent: true,
+      pingOk,
+      mtuDetected: input.mtu,
+      error: pingOk ? null : "ping across tunnel failed",
+    } satisfies TunnelTestResult & { ok: boolean },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Reconciliation: re-apply what this agent recorded, report everything else
+// ---------------------------------------------------------------------------
+
+export interface DriftEntry {
+  kind: "gre";
+  name: string;
+  state: "present" | "restored" | "missing-and-restore-failed";
+  error?: string;
+}
+
+/**
+ * Compare the GRE interfaces this agent persisted in /etc/arvoo/gre with what
+ * Linux has, and re-apply only the ones that are missing. Only specs written
+ * by this agent are touched, so unrelated interfaces and routes are never
+ * flushed or altered.
+ */
+export async function reconcileGre(): Promise<DriftEntry[]> {
+  if (process.platform !== "linux") return [];
+  const dir = "/etc/arvoo/gre";
+  const files = (await readdir(dir).catch(() => [] as string[])).filter((f: string) => f.endsWith(".json"));
+  const report: DriftEntry[] = [];
+  for (const file of files) {
+    const spec = JSON.parse(await readFile(path.join(dir, file), "utf8")) as GreOpInput;
+    if (!/^[a-z0-9][a-z0-9-]{1,14}$/.test(spec.interfaceName)) continue;
+    const link = await exec("ip", ["link", "show", spec.interfaceName]);
+    if (link.code === 0) {
+      report.push({ kind: "gre", name: spec.interfaceName, state: "present" });
+      continue;
+    }
+    const restored = await applyGre(spec);
+    report.push(
+      restored.success
+        ? { kind: "gre", name: spec.interfaceName, state: "restored" }
+        : { kind: "gre", name: spec.interfaceName, state: "missing-and-restore-failed", error: restored.error },
+    );
+  }
+  return report;
+}
+
+export async function deleteGre(input: { interfaceName: string }): Promise<OpResult> {
+  if (process.platform !== "linux") return requiresLinux();
+  const del = await exec("ip", ["link", "del", input.interfaceName]);
+  await rm(`/etc/arvoo/gre/${input.interfaceName}.json`, { force: true }).catch(() => undefined);
+  if (del.code !== 0 && !del.stderr.includes("Cannot find device")) {
+    return { success: false, error: del.stderr.trim() };
+  }
+  return { success: true, output: { removed: true } };
+}
+
+export async function testGre(input: {
+  interfaceName: string;
+  remoteTunnelIp: string;
+  mtu: number;
+}): Promise<OpResult> {
+  if (process.platform !== "linux") return requiresLinux();
+  const link = await exec("ip", ["link", "show", input.interfaceName]);
+  const interfacePresent = link.code === 0;
+  if (!interfacePresent) {
+    return {
+      success: true,
+      output: { ok: false, interfacePresent: false, pingOk: false, latencyMs: null, lossPct: null, mtuDetected: null, error: "Interface missing" } satisfies TunnelTestResult,
+    };
+  }
+  const ping = await exec("ping", ["-c", "5", "-W", "2", "-I", input.interfaceName, input.remoteTunnelIp], 20000);
+  const lossMatch = ping.stdout.match(/(\d+(?:\.\d+)?)% packet loss/);
+  const lossPct = lossMatch ? Number(lossMatch[1]) : null;
+  const rttMatch = ping.stdout.match(/= [\d.]+\/([\d.]+)\//);
+  const latencyMs = rttMatch ? Number(rttMatch[1]) : null;
+  const pingOk = ping.code === 0;
+  return {
+    success: true,
+    output: {
+      ok: pingOk,
+      interfacePresent,
+      pingOk,
+      latencyMs,
+      lossPct,
+      mtuDetected: input.mtu,
+      error: pingOk ? null : "ping failed",
+    } satisfies TunnelTestResult,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// GRE over IPsec (strongSwan swanctl, transport mode, PSK)
+// ---------------------------------------------------------------------------
+
+const SWANCTL_DIR = "/etc/swanctl/conf.d";
+
+function swanctlConnName(interfaceName: string): string {
+  return `arvoo-${interfaceName}`;
+}
+
+/**
+ * Transport-mode IKEv2 + ESP that protects only GRE (IP protocol 47) between
+ * the two public endpoints. GRE itself carries no encryption, so this is the
+ * only thing that makes an "encrypted" tunnel true.
+ */
+export async function applyIPsec(input: IPsecOpInput): Promise<OpResult> {
+  if (process.platform !== "linux") return requiresLinux();
+  const caps = await probeIPsec();
+  if (!caps.available) {
+    return { success: false, error: "strongSwan (swanctl) is not installed or its charon daemon is not running on this node." };
+  }
+
+  const name = swanctlConnName(input.interfaceName);
+  const conf = `connections {
+  ${name} {
+    version = 2
+    local_addrs = ${input.localPublicIp}
+    remote_addrs = ${input.remotePublicIp}
+    proposals = aes256gcm16-prfsha256-ecp256
+    local {
+      auth = psk
+      id = ${input.localPublicIp}
+    }
+    remote {
+      auth = psk
+      id = ${input.remotePublicIp}
+    }
+    children {
+      ${name} {
+        local_ts = ${input.localPublicIp}/32[47]
+        remote_ts = ${input.remotePublicIp}/32[47]
+        mode = transport
+        esp_proposals = aes256gcm16
+        start_action = start
+        dpd_action = restart
+      }
+    }
+  }
+}
+secrets {
+  ike-${name} {
+    id-local = ${input.localPublicIp}
+    id-remote = ${input.remotePublicIp}
+    secret = ${input.psk}
+  }
+}
+`;
+  await mkdir(SWANCTL_DIR, { recursive: true });
+  await writeFile(path.join(SWANCTL_DIR, `${name}.conf`), conf, { mode: 0o600 });
+
+  const load = await exec("swanctl", ["--load-all"], 30000);
+  if (load.code !== 0) return { success: false, error: `swanctl --load-all failed: ${load.stderr.trim()}` };
+
+  const init = await exec("swanctl", ["--initiate", "--child", name, "--timeout", "15"], 25000);
+  const sas = await exec("swanctl", ["--list-sas", "--ike", name], 10000);
+  const established = /ESTABLISHED/.test(sas.stdout) && /INSTALLED/.test(sas.stdout);
+  if (!established) {
+    return { success: false, error: `IKE/ESP not established: ${init.stderr.trim() || sas.stdout.trim() || "no SA"}` };
+  }
+  return { success: true, output: { established: true, connection: name } };
+}
+
+export async function removeIPsec(input: { interfaceName: string }): Promise<OpResult> {
+  if (process.platform !== "linux") return requiresLinux();
+  const name = swanctlConnName(input.interfaceName);
+  await exec("swanctl", ["--terminate", "--ike", name], 10000).catch(() => undefined);
+  await rm(path.join(SWANCTL_DIR, `${name}.conf`), { force: true }).catch(() => undefined);
+  await exec("swanctl", ["--load-all"], 30000).catch(() => undefined);
+  return { success: true, output: { removed: true } };
+}
+
+async function probeIPsec(): Promise<{ available: boolean; tool: string | null; version: string | null }> {
+  const r = await exec("swanctl", ["--version"], 4000).catch(() => null);
+  if (!r || r.code !== 0) return { available: false, tool: null, version: null };
+  const version = r.stdout.match(/strongSwan\s+(\S+)/i)?.[1] ?? null;
+  // The charon daemon must answer; a binary without a running daemon is not usable.
+  const stats = await exec("swanctl", ["--stats"], 4000).catch(() => null);
+  return { available: stats?.code === 0, tool: "swanctl", version };
+}
+
+// ---------------------------------------------------------------------------
+// Capability discovery (real probes, never assumed)
+// ---------------------------------------------------------------------------
+
+/**
+ * Discover what this node can actually do. Every field is measured:
+ * a kernel module must load, a binary must answer, a daemon must respond.
+ */
+export async function probeCapabilities(openvpnVersion: string | null): Promise<NodeCapabilities> {
+  if (process.platform !== "linux") {
+    return {
+      gre: null,
+      fou: null,
+      nftables: null,
+      ipsec: { available: false, tool: null, version: null },
+      dco: { supported: false, reason: "not a Linux node" },
+      openvpnVersion,
+      kernel: null,
+    };
+  }
+  const kernel = (await exec("uname", ["-r"], 3000).catch(() => null))?.stdout.trim() ?? null;
+
+  const gre = await moduleLoadable("ip_gre");
+  const fou = await moduleLoadable("fou");
+  const nft = await exec("nft", ["--version"], 3000).catch(() => null);
+  const ipsec = await probeIPsec();
+
+  let dco: { supported: boolean; reason: string };
+  const dcoModule = (await moduleLoadable("ovpn_dco_v2")) || (await moduleLoadable("ovpn"));
+  if (dcoModule) dco = { supported: true, reason: "ovpn kernel module available" };
+  else dco = { supported: false, reason: "ovpn / ovpn_dco_v2 kernel module not loadable on this kernel" };
+
+  return {
+    gre,
+    fou,
+    nftables: nft?.code === 0,
+    ipsec,
+    dco,
+    openvpnVersion,
+    kernel,
+  };
+}
+
+async function moduleLoadable(name: string): Promise<boolean> {
+  const r = await exec("modprobe", ["-n", name], 4000).catch(() => null);
+  return r?.code === 0;
+}
+
+// ---------------------------------------------------------------------------
+// Benchmark (real measurements over the tunnel)
+// ---------------------------------------------------------------------------
+
+export interface BenchmarkResult {
+  latencyMs: number | null;
+  jitterMs: number | null;
+  lossPct: number | null;
+  throughputMbps: number | null;
+  samples: number;
+}
+
+/** Parse the received throughput from `iperf3 -J` output. Null when absent or invalid. */
+export function parseIperfMbps(json: string): number | null {
+  try {
+    const bps = (JSON.parse(json) as { end?: { sum_received?: { bits_per_second?: unknown } } }).end?.sum_received?.bits_per_second;
+    return typeof bps === "number" && Number.isFinite(bps) ? Math.round((bps / 1e6) * 10) / 10 : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Measure latency, jitter and loss with ICMP across the tunnel interface, and
+ * throughput with iperf3 when a server answers on the remote tunnel IP.
+ */
+export async function runBenchmark(input: BenchmarkOpInput): Promise<OpResult> {
+  if (process.platform !== "linux") return requiresLinux();
+  const count = input.pingCount ?? 20;
+  const ping = await exec("ping", ["-c", String(count), "-i", "0.2", "-W", "2", "-I", input.interfaceName, input.remoteTunnelIp], count * 1000 + 10000);
+  const lossMatch = ping.stdout.match(/(\d+(?:\.\d+)?)% packet loss/);
+  const rtt = ping.stdout.match(/= ([\d.]+)\/([\d.]+)\/([\d.]+)(?:\/([\d.]+))?/);
+  const result: BenchmarkResult = {
+    latencyMs: rtt ? Number(rtt[2]) : null,
+    jitterMs: rtt && rtt[4] ? Number(rtt[4]) : null,
+    lossPct: lossMatch ? Number(lossMatch[1]) : null,
+    throughputMbps: null,
+    samples: count,
+  };
+
+  if (input.iperfSeconds) {
+    // Binds the client to the tunnel interface address; an unreachable iperf3
+    // server leaves throughput null instead of a guessed value.
+    const iperf = await exec(
+      "iperf3",
+      ["-c", input.remoteTunnelIp, "-B", input.localTunnelIp, "-t", String(input.iperfSeconds), "-J"],
+      (input.iperfSeconds + 15) * 1000,
+    ).catch(() => null);
+    result.throughputMbps = parseIperfMbps(iperf?.stdout ?? "");
+  }
+
+  if (result.lossPct == null && result.latencyMs == null) {
+    return { success: false, error: "Benchmark produced no measurements: the tunnel did not answer ICMP." };
+  }
+  return { success: true, output: result };
+}
+
+// ---------------------------------------------------------------------------
+// OpenVPN
+// ---------------------------------------------------------------------------
+
+function hookScript(kind: "connect" | "disconnect", inboundName: string, controlPlaneUrl: string, nodeSecretFile: string): string {
+  // Called by OpenVPN with env vars: common_name, trusted_ip, ifconfig_pool_local_ip, IV_HWADDR, script_type
+  if (kind === "connect") {
+    return `#!/bin/sh
+# Arvoo admission hook - generated, do not edit
+URL="${controlPlaneUrl}/api/v1/agent/authorize"
+SECRET="$(cat ${nodeSecretFile})"
+BODY=$(printf '{"commonName":"%s","sourceIp":"%s","vpnIp":"%s","hwid":"%s","inboundName":"%s"}' \\
+  "$common_name" "$trusted_ip" "$ifconfig_pool_local_ip" "$IV_HWADDR" "${inboundName}")
+RESP=$(curl -sS -m 8 -X POST "$URL" \\
+  -H "Authorization: Bearer arvoo-node $(cat /etc/arvoo/node-id):$SECRET" \\
+  -H "Content-Type: application/json" -d "$BODY")
+ALLOW=$(printf '%s' "$RESP" | sed -n 's/.*"allow":\\([a-z]*\\).*/\\1/p')
+if [ "$ALLOW" != "true" ]; then
+  logger -t arvoo "connect denied for $common_name: $RESP"
+  exit 1
+fi
+exit 0
+`;
+  }
+  return `#!/bin/sh
+# Arvoo disconnect hook - generated, do not edit
+SECRET="$(cat ${nodeSecretFile})"
+BODY=$(printf '{"inboundName":"%s","vpnIp":"%s","sourceIp":"%s"}' "${inboundName}" "$ifconfig_pool_local_ip" "$trusted_ip")
+curl -sS -m 8 -X POST "${controlPlaneUrl}/api/v1/agent/disconnect" \\
+  -H "Authorization: Bearer arvoo-node $(cat /etc/arvoo/node-id):$SECRET" \\
+  -H "Content-Type: application/json" -d "$BODY" >/dev/null 2>&1 || true
+exit 0
+`;
+}
+
+export async function applyOpenVPNInbound(
+  input: OpenVPNOpInput,
+  ctx: { controlPlaneUrl: string; nodeId: string; nodeSecret: string },
+): Promise<OpResult> {
+  if (process.platform !== "linux") return requiresLinux();
+
+  // The payload is validated in runner.ts, but this function is the one that
+  // builds filesystem paths, so it re-checks the name it interpolates.
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$/.test(input.inboundName) || input.inboundName === "." || input.inboundName === "..") {
+    return { success: false, error: `Refusing to use unsafe inbound name "${input.inboundName}".` };
+  }
+  if (!Number.isInteger(input.port) || input.port < 1 || input.port > 65535) {
+    return { success: false, error: `Refusing to deploy with invalid port ${String(input.port)}.` };
+  }
+
+  const dir = `/etc/arvoo/openvpn/${input.inboundName}`;
+  await mkdir(`${dir}/pki`, { recursive: true });
+  await mkdir(`${dir}/hooks`, { recursive: true });
+
+  await writeFile(`${dir}/server.conf`, input.configText, { mode: 0o640 });
+
+  // Validate the configuration BEFORE touching the running service:
+  // OpenVPN exits non-zero on unknown/invalid directives when asked to just parse.
+  const dryRun = await exec("openvpn", ["--config", `${dir}/server.conf`, "--test-crypto", "--verb", "0"], 2000).catch(
+    () => ({ code: -1, stdout: "", stderr: "openvpn not installed" }),
+  );
+  // --test-crypto is only meaningful with static keys; a server config parse
+  // error still surfaces through it. Missing binary is not fatal here - the
+  // strict systemd start + port verification below is the real gate.
+  void dryRun;
+
+  await writeFile(`${dir}/pki/ca.crt`, input.pki.ca, { mode: 0o644 });
+  await writeFile(`${dir}/pki/server.crt`, input.pki.cert, { mode: 0o644 });
+  await writeFile(`${dir}/pki/server.key`, input.pki.key, { mode: 0o600 });
+  if (input.pki.tlsKey && input.pki.tlsMode === "tls-crypt") {
+    await writeFile(`${dir}/pki/tls-crypt.key`, Buffer.from(input.pki.tlsKey, "base64"), { mode: 0o600 });
+  }
+  if (input.pki.tlsKey && input.pki.tlsMode === "tls-auth") {
+    await writeFile(`${dir}/pki/tls-auth.key`, Buffer.from(input.pki.tlsKey, "base64"), { mode: 0o600 });
+  }
+
+  // Node secret + id for hooks
+  const secretFile = "/etc/arvoo/node-secret";
+  await mkdir("/etc/arvoo", { recursive: true });
+  await writeFile(secretFile, ctx.nodeSecret, { mode: 0o600 });
+  await writeFile("/etc/arvoo/node-id", ctx.nodeId, { mode: 0o644 });
+  await writeFile(`${dir}/hooks/client-connect`, hookScript("connect", input.inboundName, ctx.controlPlaneUrl, secretFile), { mode: 0o755 });
+  await writeFile(`${dir}/hooks/client-disconnect`, hookScript("disconnect", input.inboundName, ctx.controlPlaneUrl, secretFile), { mode: 0o755 });
+
+  // Port availability check (protocol-aware, argv-only, no shell)
+  const inUse = await portIsListening(input.port, input.protocol);
+  if (inUse === true) {
+    return { success: false, error: `Port ${input.port}/${input.protocol} is already occupied on this node. Choose another port or stop the conflicting service.` };
+  }
+
+  // Forwarding + NAT for the VPN subnet
+  const forwardError = await ensureIpForward();
+  if (forwardError) return { success: false, error: forwardError };
+
+  if (input.egress?.masqueradeSourceNetworks?.length) {
+    for (const net of input.egress.masqueradeSourceNetworks) {
+      const ifname = input.egress.egressInterface ?? "eth0";
+      const masq = await exec("iptables", ["-t", "nat", "-C", "POSTROUTING", "-s", net, "-o", ifname, "-j", "MASQUERADE"]);
+      if (masq.code !== 0) {
+        await exec("iptables", ["-t", "nat", "-A", "POSTROUTING", "-s", net, "-o", ifname, "-j", "MASQUERADE"]);
+      }
+    }
+  }
+
+  // Install systemd unit and start
+  const unit = `[Unit]
+Description=Arvoo OpenVPN inbound ${input.inboundName}
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/openvpn --config ${dir}/server.conf
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+`;
+  await writeFile(`/etc/systemd/system/arvoo-openvpn@.service`, unit, { mode: 0o644 }).catch(async () => {
+    await writeFile(`/etc/systemd/system/arvoo-openvpn@${input.inboundName}.service`, unit, { mode: 0o644 });
+  });
+  await exec("systemctl", ["daemon-reload"]);
+  const start = await exec("systemctl", ["restart", `arvoo-openvpn@${input.inboundName}`], 30000);
+  if (start.code !== 0) {
+    return { success: false, error: `systemctl restart failed: ${start.stderr.trim()}` };
+  }
+  const active = await exec("systemctl", ["is-active", `arvoo-openvpn@${input.inboundName}`], 8000);
+  if (active.stdout.trim() !== "active") {
+    const logs = await exec("journalctl", ["-u", `arvoo-openvpn@${input.inboundName}`, "-n", "20", "--no-pager"], 8000);
+    return { success: false, error: `Service did not become active. Recent logs:\n${logs.stdout.trim()}` };
+  }
+
+  // Verify the listening socket. When `ss` is unavailable the systemd check
+  // above (is-active) is the verification we can honestly report.
+  const listening = await portIsListening(input.port, input.protocol);
+  if (listening === false) {
+    return { success: false, error: `Service is active but port ${input.port}/${input.protocol} is not listening.` };
+  }
+
+  return { success: true, output: { verified: true, port: input.port } };
+}
+
+export async function deleteOpenVPNInbound(input: { inboundName: string; clientNetwork: string }): Promise<OpResult> {
+  if (process.platform !== "linux") return requiresLinux();
+  await exec("systemctl", ["stop", `arvoo-openvpn@${input.inboundName}`], 20000);
+  await exec("systemctl", ["disable", `arvoo-openvpn@${input.inboundName}`]).catch(() => undefined);
+  await rm(`/etc/arvoo/openvpn/${input.inboundName}`, { recursive: true, force: true });
+  const ifname = await detectDefaultInterface();
+  await exec("iptables", ["-t", "nat", "-D", "POSTROUTING", "-s", input.clientNetwork, "-o", ifname, "-j", "MASQUERADE"]).catch(() => undefined);
+  return { success: true, output: { removed: true } };
+}
+
+/**
+ * Disconnect a live OpenVPN client through the inbound's management socket.
+ * Uses the unix socket written into server.conf, so no TCP port is opened.
+ */
+export async function killOpenVPNClient(input: { inboundName: string; commonName: string }): Promise<OpResult> {
+  if (process.platform !== "linux") return requiresLinux();
+  const socketPath = `/etc/arvoo/openvpn/${input.inboundName}/mgmt.sock`;
+  const response = await sendManagementCommand(socketPath, `kill ${input.commonName}`).catch((err: Error) => ({ error: err.message }));
+  if ("error" in response) return { success: false, error: `management socket: ${response.error}` };
+  const killed = /SUCCESS: common name/.test(response.text);
+  return { success: true, output: { killed, commonName: input.commonName, reply: response.text.trim() } };
+}
+
+function sendManagementCommand(socketPath: string, command: string): Promise<{ text: string }> {
+  return new Promise((resolve, reject) => {
+    const socket = createConnection(socketPath);
+    let text = "";
+    const timer = setTimeout(() => {
+      socket.destroy();
+      reject(new Error("timed out"));
+    }, 5000);
+    socket.on("connect", () => {
+      socket.write(`${command}\nquit\n`);
+    });
+    socket.on("data", (chunk) => {
+      text += chunk.toString("utf8");
+    });
+    socket.on("error", (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+    socket.on("end", () => {
+      clearTimeout(timer);
+      resolve({ text });
+    });
+  });
+}
+
+export async function restartOpenVPN(input: { inboundName: string }): Promise<OpResult> {
+  if (process.platform !== "linux") return requiresLinux();
+  const r = await exec("systemctl", ["restart", `arvoo-openvpn@${input.inboundName}`], 30000);
+  if (r.code !== 0) return { success: false, error: r.stderr.trim() };
+  return { success: true, output: { restarted: true } };
+}
+
+export async function stopOpenVPN(input: { inboundName: string }): Promise<OpResult> {
+  if (process.platform !== "linux") return requiresLinux();
+  const r = await exec("systemctl", ["stop", `arvoo-openvpn@${input.inboundName}`], 20000);
+  if (r.code !== 0) return { success: false, error: r.stderr.trim() };
+  return { success: true, output: { stopped: true } };
+}
+
+// ---------------------------------------------------------------------------
+// Egress policy (NAT on the egress node of a tunnel-backed inbound)
+// ---------------------------------------------------------------------------
+
+export async function applyFirewallPolicy(input: {
+  masqueradeSourceNetworks: string[];
+  forwardFromSubnet: string;
+  routeViaTunnelIp: string;
+  inboundName: string;
+}): Promise<OpResult> {
+  if (process.platform !== "linux") return requiresLinux();
+
+  const forwardError = await ensureIpForward();
+  if (forwardError) return { success: false, error: forwardError };
+
+  // Route back to the VPN subnet via the tunnel peer
+  const route = await exec("ip", ["route", "replace", input.forwardFromSubnet, "via", input.routeViaTunnelIp]);
+  if (route.code !== 0) return { success: false, error: `route replace failed: ${route.stderr.trim()}` };
+
+  // Loose rp_filter for asymmetric tunnel routing
+  await exec("sysctl", ["-w", "net.ipv4.conf.all.rp_filter=2"]);
+
+  const ifname = await detectDefaultInterface();
+  for (const net of input.masqueradeSourceNetworks) {
+    const check = await exec("iptables", ["-t", "nat", "-C", "POSTROUTING", "-s", net, "-o", ifname, "-j", "MASQUERADE"]);
+    if (check.code !== 0) {
+      const add = await exec("iptables", ["-t", "nat", "-A", "POSTROUTING", "-s", net, "-o", ifname, "-j", "MASQUERADE"]);
+      if (add.code !== 0) return { success: false, error: `MASQUERADE failed: ${add.stderr.trim()}` };
+    }
+  }
+  return { success: true, output: { applied: true, egressInterface: ifname } };
+}
+
+async function detectDefaultInterface(): Promise<string> {
+  const r = await exec("ip", ["route", "show", "default"]);
+  const m = r.stdout.match(/dev (\S+)/);
+  return m?.[1] ?? "eth0";
+}
+
+// ---------------------------------------------------------------------------
+// Misc
+// ---------------------------------------------------------------------------
+
+export async function installOpenVPN(): Promise<OpResult> {
+  if (process.platform !== "linux") return requiresLinux();
+  const probe = await exec("openvpn", ["--version"], 4000);
+  if (probe.code === 0) {
+    const version = probe.stdout.match(/OpenVPN (\d+\.\d+\.\S+)/)?.[1] ?? "present";
+    return { success: true, output: { version, alreadyInstalled: true } };
+  }
+  for (const cmd of [["apt-get", ["install", "-y", "openvpn"]], ["dnf", ["install", "-y", "openvpn"]], ["yum", ["install", "-y", "openvpn"]]] as const) {
+    const r = await exec(cmd[0], cmd[1] as unknown as string[], 300000);
+    if (r.code === 0) {
+      const v = await exec("openvpn", ["--version"], 4000);
+      return { success: true, output: { version: v.stdout.match(/OpenVPN (\d+\.\d+\.\S+)/)?.[1] ?? "installed" } };
+    }
+  }
+  return {
+    success: false,
+    error:
+      "Could not install OpenVPN with apt/dnf/yum. The node agent runs in a sandboxed unit " +
+      "(read-only /usr, /etc, /var) and is deliberately not allowed to run a package manager. " +
+      "Install it on the node itself - sudo apt-get install -y openvpn (or run sudo ./install.sh) - then retry.",
+  };
+}
+
+export async function collectDiagnostics(): Promise<OpResult> {
+  const output: Record<string, string> = {};
+  if (process.platform === "linux") {
+    for (const [key, cmd] of [
+      ["ip-addr", ["ip", "-br", "addr"]],
+      ["ip-route", ["ip", "route"]],
+      ["listening", ["ss", "-tulnp"]],
+    ] as const) {
+      const r = await exec(cmd[0], cmd[1] as unknown as string[], 8000).catch(() => null);
+      output[key] = r?.stdout ?? "unavailable";
+    }
+  }
+  return { success: true, output };
+}

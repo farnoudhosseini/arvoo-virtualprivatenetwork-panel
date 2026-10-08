@@ -1,0 +1,4 @@
+# Arvoo public site - indexable (the management panel is not, and is not linked here).
+User-agent: *
+Allow: /
+Sitemap: https://__SITE_DOMAIN__/sitemap.xml

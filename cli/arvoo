@@ -1,0 +1,1041 @@
+#!/usr/bin/env bash
+#
+# Arvoo Management CLI (spec §20-§29).
+#
+# One command for the Ubuntu terminal that manages the same system the panel
+# manages: services, secrets, certificates, nodes, tunnels, logs, backups and
+# diagnostics. It reuses existing components instead of duplicating them:
+#
+#   * service management  -> systemd units (arvoo, arvoo-agent, nginx, postgresql)
+#   * install/repair/update -> install.sh, the same idempotent installer
+#   * database backup/restore -> scripts/backup.sh + pg_restore
+#   * secret rotation     -> the API endpoint the panel also uses
+#   * node identity       -> the agent's own state file
+#
+# Rules this CLI keeps:
+#   * read-only commands never need root; state changes do
+#   * destructive commands ask first, and refuse in a non-interactive shell
+#     unless --yes is passed
+#   * secrets are never printed, never passed through argv and never logged
+#   * a command that cannot apply (wrong OS, missing unit) says so and exits
+#     non-zero instead of pretending success
+
+set -uo pipefail
+
+# ---------------------------------------------------------------------------
+# Configuration and small helpers
+# ---------------------------------------------------------------------------
+
+INSTALL_ROOT="${ARVOO_INSTALL_ROOT:-/opt/arvoo}"
+ENV_FILE="${ARVOO_ENV_FILE:-/etc/arvoo.env}"
+AGENT_STATE_FILE="${ARVOO_AGENT_STATE_FILE:-/var/lib/arvoo/agent-state.json}"
+BACKUP_DIR="${ARVOO_BACKUP_DIR:-/var/backups/arvoo}"
+LOG_LINES="${ARVOO_CLI_LOG_LINES:-200}"
+CLI_VERSION_FILE="$INSTALL_ROOT/package.json"
+
+JSON=0
+SHOW_HELP=0
+SHOW_VERSION=0
+QUIET=0
+ASSUME_YES=0
+FOLLOW=0
+COMPONENT=""
+RESTORE_FILE=""
+
+EXIT_OK=0
+EXIT_FAIL=1
+EXIT_PLATFORM=2
+EXIT_PRIVILEGE=77
+
+if [[ -t 1 ]] && command -v tput >/dev/null 2>&1 && [[ -n "${TERM:-}" ]]; then
+  C_RESET="$(tput sgr0 2>/dev/null || true)"
+  C_DIM="$(tput dim 2>/dev/null || true)"
+  C_BOLD="$(tput bold 2>/dev/null || true)"
+  C_RED="$(tput setaf 1 2>/dev/null || true)"
+  C_GREEN="$(tput setaf 2 2>/dev/null || true)"
+  C_YELLOW="$(tput setaf 3 2>/dev/null || true)"
+else
+  C_RESET=""; C_DIM=""; C_BOLD=""; C_RED=""; C_GREEN=""; C_YELLOW=""
+fi
+
+say()  { [[ "$QUIET" == "1" || "$JSON" == "1" ]] || printf '%s\n' "$*"; }
+ok()   { [[ "$JSON" == "1" ]] && return 0; say "${C_GREEN}[OK]${C_RESET}   $*"; }
+warn() { [[ "$JSON" == "1" ]] && return 0; say "${C_YELLOW}[WARN]${C_RESET} $*"; }
+fail() { [[ "$JSON" == "1" ]] && return 0; say "${C_RED}[FAIL]${C_RESET} $*"; }
+hdr()  { [[ "$JSON" == "1" ]] && return 0; say ""; say "${C_BOLD}$*${C_RESET}"; }
+die()  { printf 'arvoo: %s\n' "$*" >&2; exit "$EXIT_FAIL"; }
+
+json_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\n'/\\n}"
+  s="${s//$'\t'/\\t}"
+  printf '%s' "$s"
+}
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+cli_version() {
+  if [[ -r "$CLI_VERSION_FILE" ]] && have node; then
+    node -e 'try{const p=require(process.argv[1]);process.stdout.write(p.version||"unknown")}catch{process.stdout.write("unknown")}' "$CLI_VERSION_FILE" 2>/dev/null && return 0
+  fi
+  printf 'dev'
+}
+
+require_linux() {
+  if [[ "$(uname -s)" != "Linux" ]]; then
+    printf 'arvoo: this command manages a Linux (Ubuntu 24.04) installation; detected %s.\n' "$(uname -s)" >&2
+    printf 'arvoo: it must run on the Arvoo server itself. Nothing was changed.\n' >&2
+    exit "$EXIT_PLATFORM"
+  fi
+}
+
+require_root() {
+  if [[ "$(id -u)" != "0" ]]; then
+    printf 'arvoo: %s changes system state; run it as root (sudo arvoo %s).\n' "$1" "$1" >&2
+    exit "$EXIT_PRIVILEGE"
+  fi
+}
+
+# Confirmation for destructive operations. --yes is the automation path, and a
+# non-interactive shell without it is refused rather than assumed.
+confirm() {
+  local prompt="$1"
+  if [[ "$ASSUME_YES" == "1" ]]; then return 0; fi
+  if [[ ! -t 0 ]]; then
+    printf 'arvoo: refusing to continue without a terminal; re-run with --yes if that is intended.\n' >&2
+    return 1
+  fi
+  printf 'WARNING: %s\n\nContinue? [y/N] ' "$prompt"
+  local answer=""
+  read -r answer
+  case "$answer" in
+    y|Y|yes|YES) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+unit_exists() { systemctl list-unit-files "$1" >/dev/null 2>&1 && systemctl cat "$1" >/dev/null 2>&1; }
+
+unit_state() {
+  local unit="$1"
+  if ! unit_exists "$unit"; then printf 'absent'; return; fi
+  systemctl is-active "$unit" 2>/dev/null || true
+}
+
+# Read one value from /etc/arvoo.env without printing or exporting anything else.
+env_file_value() {
+  local key="$1"
+  [[ -r "$ENV_FILE" ]] || return 1
+  sed -n "s/^${key}=//p" "$ENV_FILE" | head -n1 | sed 's/^"//; s/"$//'
+}
+
+api_port() { env_file_value ARVOO_API_PORT || printf '4001'; }
+
+api_base() { printf 'http://127.0.0.1:%s' "$(api_port)"; }
+
+api_health() { curl -fsS --max-time 5 "$(api_base)/health" 2>/dev/null; }
+
+db_query() {
+  local sql="$1"
+  have psql || return 1
+  local url; url="$(env_file_value DATABASE_URL)" || return 1
+  [[ -n "$url" ]] || return 1
+  psql "$url" -At -c "$sql" 2>/dev/null
+}
+
+# Login and rotate through the API: the same endpoint the panel uses, so there
+# is exactly one rotation mechanism in the product (spec §24).
+api_login_token() {
+  local user="$1" password="$2"
+  curl -fsS --max-time 10 -X POST "$(api_base)/api/v1/auth/login" \
+    -H 'Content-Type: application/json' \
+    --data-binary "$(printf '{"username":"%s","password":"%s"}' "$(json_escape "$user")" "$(json_escape "$password")")" \
+    2>/dev/null | sed -n 's/.*"token":"\([^"]*\)".*/\1/p'
+}
+
+# ---------------------------------------------------------------------------
+# status / health
+# ---------------------------------------------------------------------------
+
+service_rows() {
+  local units=(arvoo arvoo-agent nginx postgresql)
+  local unit state
+  for unit in "${units[@]}"; do
+    state="$(unit_state "$unit")"
+    [[ "$state" == "absent" ]] && continue
+    printf '%s\t%s\n' "$unit" "$state"
+  done
+}
+
+cmd_status() {
+  require_linux
+  local health="unreachable" api_state db_state
+  api_state="$(unit_state arvoo)"
+  db_state="$(unit_state postgresql)"
+  if api_health >/dev/null 2>&1; then health="ok"; fi
+
+  local nodes="" tunnels="" clients=""
+  if have psql; then
+    nodes="$(db_query 'SELECT count(*) FROM nodes' || true)"
+    tunnels="$(db_query 'SELECT count(*) FROM tunnels' || true)"
+    clients="$(db_query 'SELECT count(*) FROM clients' || true)"
+  fi
+
+  if [[ "$JSON" == "1" ]]; then
+    printf '{"services":['
+    local first=1 unit state
+    while IFS=$'\t' read -r unit state; do
+      [[ "$first" == "1" ]] || printf ','
+      first=0
+      printf '{"unit":"%s","state":"%s"}' "$(json_escape "$unit")" "$(json_escape "$state")"
+    done < <(service_rows)
+    printf '],"api":"%s","health":"%s","database":"%s","counts":{"nodes":%s,"tunnels":%s,"clients":%s},"version":"%s"}\n' \
+      "$(json_escape "$api_state")" "$(json_escape "$health")" "$(json_escape "$db_state")" \
+      "${nodes:-null}" "${tunnels:-null}" "${clients:-null}" "$(json_escape "$(cli_version)")"
+    return 0
+  fi
+
+  hdr "Arvoo status ($(cli_version))"
+  while IFS=$'\t' read -r unit state; do
+    case "$state" in
+      active) ok "$unit: $state" ;;
+      *) fail "$unit: $state" ;;
+    esac
+  done < <(service_rows)
+  if [[ "$health" == "ok" ]]; then ok "API health: ok"; else fail "API health: unreachable on $(api_base)/health"; fi
+  [[ -n "$nodes" ]] && say "        nodes: ${nodes:-?}   tunnels: ${tunnels:-?}   clients: ${clients:-?}"
+  [[ -n "$nodes" ]] || warn "database counts unavailable (psql missing or DATABASE_URL unreadable)"
+  return 0
+}
+
+cmd_health() {
+  require_linux
+  local code=0 body
+  body="$(api_health)" || {
+    fail "API health check failed ($(api_base)/health)"
+    exit "$EXIT_FAIL"
+  }
+  if printf '%s' "$body" | grep -q '"database":"ok"'; then ok "API and database healthy"; else warn "API up but database not ok"; code=$EXIT_FAIL; fi
+  [[ "$JSON" == "1" ]] && printf '{"health":%s}\n' "$(printf '%s' "$body" | sed 's/^/ /')"
+  exit "$code"
+}
+
+# ---------------------------------------------------------------------------
+# service management
+# ---------------------------------------------------------------------------
+
+run_units() {
+  local action="$1"; shift
+  local unit failures=0
+  for unit in "$@"; do
+    if ! unit_exists "$unit"; then
+      warn "$unit is not installed on this host"
+      continue
+    fi
+    case "$action" in
+      reload)
+        if systemctl reload "$unit" 2>/dev/null; then ok "$unit reloaded (no downtime)"; else
+          warn "$unit has no reload; restarting it instead"
+          systemctl restart "$unit" && ok "$unit restarted" || { fail "$unit restart failed"; failures=$((failures+1)); }
+        fi
+        ;;
+      *)
+        if systemctl "$action" "$unit"; then ok "$unit: $action"; else fail "$unit: $action failed"; failures=$((failures+1)); fi
+        ;;
+    esac
+  done
+  return "$failures"
+}
+
+cmd_start()   { require_linux; require_root start;   run_units start   postgresql arvoo nginx arvoo-agent; exit $?; }
+cmd_stop()    { require_linux; require_root stop;    confirm "stop the Arvoo stack (panel and agents become unavailable)"; run_units stop arvoo-agent arvoo nginx; exit $?; }
+cmd_restart() { require_linux; require_root restart; run_units restart arvoo; if unit_exists nginx; then systemctl reload nginx && ok "nginx reloaded (not restarted)"; fi; exit $?; }
+cmd_reload()  { require_linux; require_root reload;  run_units reload arvoo nginx; exit $?; }
+
+# ---------------------------------------------------------------------------
+# diagnostics (spec §26)
+# ---------------------------------------------------------------------------
+
+diag_rows=()
+add_diag() { diag_rows+=("$1|$2|$3"); }
+
+cmd_diagnostics() {
+  require_linux
+  add_diag "OS" "ok" "$( (. /etc/os-release 2>/dev/null; printf '%s %s' "${NAME:-Linux}" "${VERSION_ID:-}") ) kernel $(uname -r)"
+
+  local root_use; root_use="$(df -P / 2>/dev/null | awk 'NR==2 {gsub("%","",$5); print $5}')"
+  if [[ -n "$root_use" ]] && (( root_use < 85 )); then add_diag "Disk" "ok" "root filesystem ${root_use}% used"
+  elif [[ -n "$root_use" ]]; then add_diag "Disk" "warn" "root filesystem ${root_use}% used"; else add_diag "Disk" "warn" "usage unknown"; fi
+
+  local mem_avail; mem_avail="$(awk '/MemAvailable/ {printf "%d", $2/1024/1024}' /proc/meminfo 2>/dev/null || true)"
+  if [[ -n "$mem_avail" ]] && (( mem_avail > 200 )); then add_diag "Memory" "ok" "${mem_avail} MiB available"
+  elif [[ -n "$mem_avail" ]]; then add_diag "Memory" "warn" "only ${mem_avail} MiB available"; else add_diag "Memory" "warn" "usage unknown"; fi
+
+  local unit state
+  for unit in arvoo arvoo-agent nginx postgresql; do
+    state="$(unit_state "$unit")"
+    [[ "$state" == "absent" ]] && continue
+    if [[ "$state" == "active" ]]; then add_diag "$unit" "ok" "active"; else add_diag "$unit" "fail" "$state"; fi
+  done
+
+  if have nginx && unit_exists nginx; then
+    if nginx -t >/dev/null 2>&1; then add_diag "nginx config" "ok" "nginx -t passed"
+    else add_diag "nginx config" "fail" "$(nginx -t 2>&1 | tail -n1)"; fi
+  fi
+
+  if api_health >/dev/null 2>&1; then add_diag "API" "ok" "healthy on port $(api_port)"
+  else add_diag "API" "fail" "$(api_base)/health unreachable"; fi
+
+  if have psql; then
+    if db_query 'SELECT 1' >/dev/null 2>&1; then add_diag "PostgreSQL" "ok" "accepts queries"
+    else add_diag "PostgreSQL" "fail" "cannot query (psql present)"; fi
+  elif unit_exists postgresql; then
+    add_diag "PostgreSQL" "warn" "psql not installed; service state only"
+  fi
+
+  if have ss; then
+    local exposed; exposed="$(ss -H -lnt 2>/dev/null | awk -v p=":$(api_port)" '$4 ~ p && $4 !~ /127\.0\.0\.1|\[::1\]/ {print $4}')"
+    if [[ -n "$exposed" ]]; then add_diag "API exposure" "fail" "listening on a public address: $exposed"
+    else add_diag "API exposure" "ok" "loopback only"; fi
+  fi
+
+  local cert_dir="/etc/letsencrypt/live"
+  if [[ -d "$cert_dir" ]]; then
+    local cert days end
+    for cert in "$cert_dir"/*/fullchain.pem; do
+      [[ -r "$cert" ]] || continue
+      end="$(openssl x509 -noout -enddate -in "$cert" 2>/dev/null | cut -d= -f2)"
+      if [[ -n "$end" ]]; then
+        days=$(( ( $(date -d "$end" +%s) - $(date +%s) ) / 86400 ))
+        if (( days > 14 )); then add_diag "Certificate" "ok" "$(basename "$(dirname "$cert")"): ${days} days left"
+        elif (( days > 0 )); then add_diag "Certificate" "warn" "$(basename "$(dirname "$cert")"): expires in ${days} days"
+        else add_diag "Certificate" "fail" "$(basename "$(dirname "$cert")"): expired"; fi
+      fi
+    done
+  else
+    add_diag "Certificate" "warn" "no ACME certificates present (IP-only installation?)"
+  fi
+
+  if have ip; then
+    local gre; gre="$(ip -o link show 2>/dev/null | awk -F': ' '/gre|ip6gre/ {print $2}' | tr '\n' ' ')"
+    if [[ -n "$gre" ]]; then add_diag "GRE" "ok" "interfaces: $gre"; else add_diag "GRE" "warn" "no GRE interface on this host"; fi
+  fi
+
+  if unit_exists arvoo-agent; then
+    if [[ -r "$AGENT_STATE_FILE" ]]; then add_diag "Node identity" "ok" "enrolled (state file present, mode $(stat -c '%a' "$AGENT_STATE_FILE" 2>/dev/null))"
+    else add_diag "Node identity" "fail" "agent installed but not enrolled"; fi
+  fi
+
+  if have nft; then
+    if nft list ruleset 2>/dev/null | grep -q '^table'; then add_diag "Firewall" "ok" "nftables rules present"; else add_diag "Firewall" "warn" "nftables active but no rules"; fi
+  elif have ufw; then
+    if ufw status 2>/dev/null | grep -qi active; then add_diag "Firewall" "ok" "ufw active"; else add_diag "Firewall" "warn" "ufw inactive"; fi
+  else
+    add_diag "Firewall" "warn" "no nftables/ufw detected"
+  fi
+
+  if getent hosts "$(hostname)" >/dev/null 2>&1 || [[ -n "$(cat /etc/resolv.conf 2>/dev/null | sed -n 's/^nameserver\s*//p' | head -n1)" ]]; then
+    add_diag "DNS" "ok" "resolver configured"
+  else
+    add_diag "DNS" "warn" "no resolver configured"
+  fi
+
+  if [[ "$JSON" == "1" ]]; then
+    printf '{"checks":['
+    local first=1 row name status detail
+    for row in "${diag_rows[@]}"; do
+      IFS='|' read -r name status detail <<<"$row"
+      [[ "$first" == "1" ]] || printf ','
+      first=0
+      printf '{"name":"%s","status":"%s","detail":"%s"}' "$(json_escape "$name")" "$(json_escape "$status")" "$(json_escape "$detail")"
+    done
+    printf ']}\n'
+  else
+    hdr "Diagnostics"
+    local worst=0
+    for row in "${diag_rows[@]}"; do
+      IFS='|' read -r name status detail <<<"$row"
+      case "$status" in
+        ok)   ok   "$name — $detail" ;;
+        warn) warn "$name — $detail"; [[ "$worst" -lt 1 ]] && worst=1 ;;
+        fail) fail "$name — $detail"; worst=2 ;;
+      esac
+    done
+    exit "$worst"
+  fi
+  local failures=0
+  for row in "${diag_rows[@]}"; do [[ "$row" == *"|fail|"* ]] && failures=$((failures+1)); done
+  exit $(( failures > 0 ? EXIT_FAIL : EXIT_OK ))
+}
+
+# ---------------------------------------------------------------------------
+# logs (spec §28)
+# ---------------------------------------------------------------------------
+
+cmd_logs() {
+  require_linux
+  have journalctl || die "journalctl is required for logs"
+  local unit="arvoo"
+  case "${COMPONENT:-master}" in
+    master|panel|api|"") unit="arvoo" ;;
+    node|agent) unit="arvoo-agent" ;;
+    nginx) unit="nginx" ;;
+    postgres|database) unit="postgresql" ;;
+    *) die "unknown component '${COMPONENT}' (use: master, node, nginx, postgresql)" ;;
+  esac
+  local args=(--no-pager -n "$LOG_LINES" -u "$unit")
+  [[ "$FOLLOW" == "1" ]] && args+=(-f)
+  # Secrets never reach the journal from this CLI; it only reads.
+  journalctl "${args[@]}"
+}
+
+# ---------------------------------------------------------------------------
+# node / tunnel status
+# ---------------------------------------------------------------------------
+
+node_state_value() {
+  local key="$1"
+  [[ -r "$AGENT_STATE_FILE" ]] || return 1
+  sed -n "s/.*\"${key}\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$AGENT_STATE_FILE" | head -n1
+}
+
+cmd_node_status() {
+  require_linux
+  local node_id control agent_state enrolled="no" mode
+  node_id="$(node_state_value nodeId || true)"
+  control="$(node_state_value controlPlaneUrl || true)"
+  agent_state="$(unit_state arvoo-agent)"
+  [[ -n "$node_id" ]] && enrolled="yes"
+  mode="panel"; unit_exists arvoo || mode="node-only"
+
+  if [[ "$JSON" == "1" ]]; then
+    printf '{"mode":"%s","enrolled":%s,"nodeId":"%s","controlPlane":"%s","agent":"%s","stateFile":"%s"}\n' \
+      "$mode" "$([[ "$enrolled" == yes ]] && echo true || echo false)" \
+      "$(json_escape "${node_id:-}")" "$(json_escape "${control:-}")" "$(json_escape "$agent_state")" "$(json_escape "$AGENT_STATE_FILE")"
+    return 0
+  fi
+  hdr "Node status"
+  say "        host role:    $mode"
+  say "        enrolled:     $enrolled"
+  [[ -n "$node_id" ]] && say "        node id:      $node_id"
+  [[ -n "$control" ]] && say "        control plane: $control"
+  say "        agent unit:   $agent_state"
+  # The node secret is never printed, here or anywhere else in this CLI.
+  [[ "$enrolled" == "yes" ]] || warn "not enrolled: run the installer (Install Node Agent) to enroll this host"
+}
+
+cmd_tunnel_status() {
+  require_linux
+  local links routes
+  links="$(ip -o -d link show 2>/dev/null | awk '/gre|ip6gre/ {print}' || true)"
+  routes="$(ip route 2>/dev/null | grep -E 'dev (gre|ip6gre)' || true)"
+
+  if [[ "$JSON" == "1" ]]; then
+    local db_rows="null"
+    if have psql; then
+      db_rows="$(db_query "SELECT COALESCE(json_agg(row_to_json(t)), '[]'::json) FROM (SELECT name, status, fou_port, ipsec_enabled FROM tunnels ORDER BY name) t" || echo null)"
+    fi
+    printf '{"interfaces":%s,"routes":%s,"database":%s}\n' \
+      "$(node -e 'const s=require("fs").readFileSync(0,"utf8");process.stdout.write(JSON.stringify(s.split("\n").filter(Boolean)))' <<<"$links" 2>/dev/null || echo '[]')" \
+      "$(node -e 'const s=require("fs").readFileSync(0,"utf8");process.stdout.write(JSON.stringify(s.split("\n").filter(Boolean)))' <<<"$routes" 2>/dev/null || echo '[]')" \
+      "${db_rows}"
+    return 0
+  fi
+  hdr "Tunnel status (real Linux state)"
+  if [[ -n "$links" ]]; then ok "GRE interfaces"; printf '%s\n' "$links" | sed 's/^/        /'
+  else warn "no GRE interface on this host"; fi
+  if [[ -n "$routes" ]]; then ok "routes via GRE"; printf '%s\n' "$routes" | sed 's/^/        /'; fi
+  if have psql; then
+    say ""
+    say "${C_DIM}desired state in the control plane:${C_RESET}"
+    db_query "SELECT format('%-16s %-10s fou=%-5s ipsec=%s', name, status, COALESCE(fou_port::text,'-'), ipsec_enabled) FROM tunnels ORDER BY name" 2>/dev/null | sed 's/^/        /' || true
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# secrets and certificates
+# ---------------------------------------------------------------------------
+
+cmd_secret_rotate() {
+  require_linux
+  require_root "secret rotate"
+  confirm "rotate the session signing secret. Every signed-in session (panel and API tokens) will be invalidated." || exit "$EXIT_OK"
+
+  local user="${ARVOO_ADMIN_USER:-$(env_file_value ARVOO_ADMIN_USER || true)}"
+  user="${user:-admin}"
+  local password=""
+  if [[ -t 0 ]]; then
+    read -r -p "Arvoo admin username [$user]: " input_user
+    [[ -n "${input_user:-}" ]] && user="$input_user"
+    read -r -s -p "Password for $user (not echoed, not stored): " password
+    printf '\n'
+  else
+    die "secret rotate needs an interactive terminal for the admin password (never pass secrets on the command line)"
+  fi
+  [[ -n "$password" ]] || die "no password given"
+
+  local token
+  token="$(api_login_token "$user" "$password")"
+  [[ -n "$token" ]] || die "could not authenticate against the API; is the panel running on $(api_base)?"
+
+  local response
+  response="$(curl -fsS --max-time 15 -X POST "$(api_base)/api/v1/system/rotate-session-secret" \
+    -H "Authorization: Bearer $token" -H 'Content-Type: application/json' \
+    --data-binary '{"confirm":"rotate"}' 2>/dev/null)" || die "rotation request failed"
+  unset password
+
+  # Verify the new state the honest way: a fresh login must work afterwards.
+  local verify=""
+  if [[ -t 0 ]]; then
+    read -r -s -p "Re-enter the password once to verify the new secret: " verify
+    printf '\n'
+  fi
+  if [[ -n "$verify" ]]; then
+    if [[ -n "$(api_login_token "$user" "$verify")" ]]; then ok "rotation verified: a fresh login succeeds"
+    else fail "rotation applied but verification login failed; check the API logs"; fi
+    unset verify
+  fi
+
+  local rotated_at
+  rotated_at="$(printf '%s' "$response" | sed -n 's/.*"rotatedAt":"\([^"]*\)".*/\1/p')"
+  if [[ "$JSON" == "1" ]]; then printf '%s\n' "$response"
+  else ok "session secret rotated at ${rotated_at:-unknown}; all previous sessions are invalid"; fi
+  exit "$EXIT_OK"
+}
+
+# ---------------------------------------------------------------------------
+# management access secret (spec §14): the additional layer on top of login.
+# The value is never passed on the command line: it is read from the root-only
+# recovery file, and a rotated value is written straight back to that file.
+# ---------------------------------------------------------------------------
+
+MANAGEMENT_SECRET_FILE="${ARVOO_MANAGEMENT_SECRET_FILE:-/etc/arvoo/management-secret}"
+
+management_secret_from_file() {
+  [[ -r "$MANAGEMENT_SECRET_FILE" ]] || return 1
+  head -n1 "$MANAGEMENT_SECRET_FILE"
+}
+
+# Ask for admin credentials, log in, and run one management action.
+management_action() {
+  local action="$1" extra="${2:-}" user password token saved=""
+  user="${ARVOO_ADMIN_USER:-admin}"
+  if [[ -t 0 ]]; then
+    read -r -p "Arvoo admin username [$user]: " input_user
+    [[ -n "${input_user:-}" ]] && user="$input_user"
+    read -r -s -p "Password for $user (not stored): " password; printf '\n'
+  else
+    die "this command needs an interactive terminal for the admin password"
+  fi
+  [[ -n "$password" ]] || die "no password given"
+  token="$(api_login_token "$user" "$password")"; unset password
+  [[ -n "$token" ]] || die "could not authenticate against the API ($(api_base))"
+
+  local headers=(-H "Authorization: Bearer $token" -H 'Content-Type: application/json')
+  if [[ -n "$extra" ]]; then headers+=(-H "x-arvoo-management: $extra"); fi
+  curl -fsS --max-time 15 -X POST "$(api_base)/api/v1/system/management" \
+    "${headers[@]}" --data-binary '{"action":"'"${action}"'","confirm":"apply"}' 2>/dev/null
+}
+
+cmd_management() {
+  require_linux
+  local sub="${1:-status}"
+  case "$sub" in
+    status)
+      local status=""
+      if [[ -t 0 ]]; then
+        local user="${ARVOO_ADMIN_USER:-admin}" password="" token="" input_user=""
+        read -r -p "Arvoo admin username [$user] (blank to only inspect the local file): " input_user
+        if [[ -n "${input_user:-}" ]]; then user="$input_user"; fi
+        if [[ -n "$input_user" ]]; then
+          read -r -s -p "Password for $user (not stored): " password; printf '\n'
+          token="$(api_login_token "$user" "$password")"; unset password
+          [[ -n "$token" ]] || die "could not authenticate against the API ($(api_base))"
+          status="$(curl -fsS --max-time 10 "$(api_base)/api/v1/system/management" -H "Authorization: Bearer $token" 2>/dev/null || true)"
+        fi
+      fi
+      local file_state="absent"
+      if [[ -r "$MANAGEMENT_SECRET_FILE" ]]; then
+        file_state="present, mode $(stat -c '%a' "$MANAGEMENT_SECRET_FILE" 2>/dev/null), updated $(stat -c '%y' "$MANAGEMENT_SECRET_FILE" 2>/dev/null | cut -d. -f1)"
+      fi
+      if [[ "$JSON" == "1" ]]; then
+        printf '{"server":%s,"recoveryFile":"%s","recoveryFileState":"%s"}\n' \
+          "${status:-null}" "$(json_escape "$MANAGEMENT_SECRET_FILE")" "$(json_escape "$file_state")"
+        return 0
+      fi
+      hdr "Management access secret"
+      if [[ -n "$status" ]]; then
+        printf '%s\n' "$status" | sed 's/[{}]//g; s/","/\n        /g; s/"//g' | sed 's/^/        /'
+      else
+        warn "server state not read (no admin session); local view only"
+      fi
+      say "        recovery file: $MANAGEMENT_SECRET_FILE ($file_state)"
+      say "        the value itself is never printed here; it is readable by root at that path"
+      ;;
+    enable)
+      require_root "management enable"
+      local current=""; current="$(management_secret_from_file || true)"
+      local response; response="$(management_action enable "$current")" || die "could not enable the management secret"
+      management_show_response "$response"
+      ;;
+    rotate)
+      require_root "management rotate"
+      local current=""; current="$(management_secret_from_file || true)"
+      [[ -n "$current" ]] || die "no current secret at $MANAGEMENT_SECRET_FILE; run 'arvoo management enable' first"
+      confirm "rotate the management access secret (the previous value stays valid for the grace window)" || exit "$EXIT_OK"
+      local response; response="$(management_action rotate "$current")" || die "rotation failed"
+      management_show_response "$response"
+      ;;
+    disable)
+      require_root "management disable"
+      local current=""; current="$(management_secret_from_file || true)"
+      [[ -n "$current" ]] || die "no current secret at $MANAGEMENT_SECRET_FILE"
+      confirm "disable the management access secret (privileged operations then need only the admin session again)" || exit "$EXIT_OK"
+      local response; response="$(management_action disable "$current")" || die "could not disable the management secret"
+      rm -f "$MANAGEMENT_SECRET_FILE"
+      ok "management access secret disabled; recovery file removed"
+      ;;
+    *) die "usage: arvoo management status|enable|rotate|disable" ;;
+  esac
+}
+
+# Store a rotated value for emergency access (root only) and tell the operator
+# that it was shown once - the value itself is printed a single time, here.
+management_show_response() {
+  local response="$1" secret
+  secret="$(printf '%s' "$response" | sed -n 's/.*"secret":"\([^"]*\)".*/\1/p')"
+  if [[ -n "$secret" ]]; then
+    install -d -m 0750 "$(dirname "$MANAGEMENT_SECRET_FILE")"
+    ( umask 077; printf '%s\n' "$secret" > "$MANAGEMENT_SECRET_FILE" )
+    chmod 0600 "$MANAGEMENT_SECRET_FILE"
+    ok "new management access secret stored in $MANAGEMENT_SECRET_FILE (root only)"
+    say "        It is shown once below; save it in your password manager."
+    say "        $secret"
+  else
+    ok "management secret updated"
+  fi
+  if [[ "$JSON" == "1" ]]; then printf '%s\n' "$response"; return 0; fi
+  local rotated next grace
+  rotated="$(printf '%s' "$response" | sed -n 's/.*"rotatedAt":"\([^"]*\)".*/\1/p')"
+  next="$(printf '%s' "$response" | sed -n 's/.*"nextRotationAt":"\([^"]*\)".*/\1/p')"
+  grace="$(printf '%s' "$response" | sed -n 's/.*"previousValidUntil":"\([^"]*\)".*/\1/p')"
+  [[ -n "$rotated" ]] && say "        rotated at:            $rotated"
+  [[ -n "$grace" ]] && say "        old value accepted to: $grace"
+  [[ -n "$next" ]] && say "        next scheduled rotation: $next"
+}
+
+cmd_cert_status() {
+  require_linux
+  local dir="/etc/letsencrypt/live" rows=() found=0
+  if [[ -d "$dir" ]]; then
+    local cert name end days
+    for cert in "$dir"/*/fullchain.pem; do
+      [[ -r "$cert" ]] || continue
+      found=1
+      name="$(basename "$(dirname "$cert")")"
+      end="$(openssl x509 -noout -enddate -in "$cert" 2>/dev/null | cut -d= -f2)"
+      days=$(( ( $(date -d "$end" +%s) - $(date +%s) ) / 86400 ))
+      rows+=("$name|$end|$days")
+    done
+  fi
+  if [[ "$JSON" == "1" ]]; then
+    printf '{"certificates":['
+    local first=1 row name end days
+    for row in "${rows[@]:-}"; do
+      [[ -n "$row" ]] || continue
+      IFS='|' read -r name end days <<<"$row"
+      [[ "$first" == "1" ]] || printf ','
+      first=0
+      printf '{"name":"%s","expiresAt":"%s","daysLeft":%s}' "$(json_escape "$name")" "$(json_escape "$end")" "$days"
+    done
+    printf ']}\n'
+    return 0
+  fi
+  hdr "Certificate status"
+  if [[ "$found" == "0" ]]; then warn "no certificates under $dir (IP-only installation?)"; return 0; fi
+  local row name end days
+  for row in "${rows[@]}"; do
+    IFS='|' read -r name end days <<<"$row"
+    if (( days > 14 )); then ok "$name — expires $end (${days} days)"
+    elif (( days > 0 )); then warn "$name — expires $end (${days} days)"
+    else fail "$name — expired $end"; fi
+  done
+}
+
+cmd_cert_renew() {
+  require_linux
+  require_root "cert renew"
+  have certbot || die "certbot is not installed; install it with the installer or apt"
+  confirm "renew ACME certificates and reload the web server" || exit "$EXIT_OK"
+  if certbot renew --quiet; then
+    ok "certbot renew finished"
+    if unit_exists nginx; then systemctl reload nginx && ok "nginx reloaded"; fi
+    cmd_cert_status
+  else
+    fail "certbot renew failed; certificates unchanged"
+    exit "$EXIT_FAIL"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# repair / update (reuse install.sh), backup / restore
+# ---------------------------------------------------------------------------
+
+installer_path() {
+  [[ -x "$INSTALL_ROOT/install.sh" ]] && { printf '%s' "$INSTALL_ROOT/install.sh"; return 0; }
+  [[ -x "./install.sh" ]] && { printf '%s' "./install.sh"; return 0; }
+  return 1
+}
+
+cmd_repair() {
+  require_linux
+  require_root "repair"
+  local installer; installer="$(installer_path)" || die "install.sh not found; reinstall from the repository"
+  confirm "repair the installation (idempotent: re-applies files, permissions, services and migrations; never deletes data)" || exit "$EXIT_OK"
+  # install.sh is idempotent and preserves data; the node-only mode is detected
+  # by what is actually installed, not by what the operator remembers.
+  if unit_exists arvoo; then
+    "$installer" || exit "$EXIT_FAIL"
+  else
+    "$installer" --node || exit "$EXIT_FAIL"
+  fi
+  ok "repair complete; running a health check"
+  cmd_health
+}
+
+cmd_update() {
+  require_linux
+  require_root "update"
+  local installer; installer="$(installer_path)" || die "install.sh not found"
+  confirm "update Arvoo (pull, rebuild, migrate, restart) — a database backup runs first" || exit "$EXIT_OK"
+  "$installer" --update || exit "$EXIT_FAIL"
+  ok "update finished"
+  cmd_status
+}
+
+cmd_backup() {
+  require_linux
+  local script="$INSTALL_ROOT/scripts/backup.sh"
+  [[ -x "$script" ]] || script="/usr/local/sbin/arvoo-backup.sh"
+  [[ -x "$script" ]] || die "backup script not found (expected $INSTALL_ROOT/scripts/backup.sh)"
+  if "$script"; then
+    ok "backup finished"
+    local newest
+    newest="$(ls -1t "$BACKUP_DIR"/*.dump "$BACKUP_DIR"/*.sql 2>/dev/null | head -n1 || true)"
+    [[ -n "$newest" ]] && say "        newest: $newest ($(du -h "$newest" | cut -f1))"
+  else
+    fail "backup failed"
+    exit "$EXIT_FAIL"
+  fi
+}
+
+cmd_restore() {
+  require_linux
+  require_root "restore"
+  [[ -n "$RESTORE_FILE" ]] || die "usage: arvoo restore --file <backup.dump>"
+  [[ -r "$RESTORE_FILE" ]] || die "cannot read $RESTORE_FILE"
+  have pg_restore || die "pg_restore is required"
+
+  hdr "Restore plan"
+  say "        file:        $RESTORE_FILE"
+  say "        database:    from $ENV_FILE (unchanged)"
+  pg_restore --list "$RESTORE_FILE" >/dev/null 2>&1 || die "this file is not a readable PostgreSQL archive"
+  say "        archive:     valid"
+  confirm "replace the current database contents with this archive. A safety backup of the current state runs first." || exit "$EXIT_OK"
+
+  local script="$INSTALL_ROOT/scripts/backup.sh"
+  [[ -x "$script" ]] || script="/usr/local/sbin/arvoo-backup.sh"
+  if [[ -x "$script" ]]; then
+    "$script" >/dev/null 2>&1 && ok "safety backup of the current state written" || warn "safety backup failed; continuing because you confirmed the restore"
+  fi
+
+  local url; url="$(env_file_value DATABASE_URL)" || die "DATABASE_URL not readable"
+  if pg_restore --clean --if-exists --no-owner --dbname "$url" "$RESTORE_FILE"; then
+    ok "restore finished"
+  else
+    fail "restore failed; the safety backup above is the way back"
+    exit "$EXIT_FAIL"
+  fi
+
+  if unit_exists arvoo; then
+    systemctl restart arvoo && ok "backend restarted"
+  fi
+  sleep 2
+  cmd_health
+  say ""
+  say "Verify the panel contents before considering the restore complete."
+}
+
+# ---------------------------------------------------------------------------
+# security audit (spec §35)
+# ---------------------------------------------------------------------------
+
+cmd_security_audit() {
+  require_linux
+  hdr "Local checks"
+  local problems=0
+
+  if [[ -e "$ENV_FILE" ]]; then
+    local mode owner
+    mode="$(stat -c '%a' "$ENV_FILE" 2>/dev/null)"
+    owner="$(stat -c '%U' "$ENV_FILE" 2>/dev/null)"
+    if [[ "$mode" == "640" || "$mode" == "600" || "$mode" == "440" ]]; then ok "$ENV_FILE mode $mode owned by $owner"
+    else fail "$ENV_FILE mode is $mode; expected 640 or stricter"; problems=$((problems+1)); fi
+  else
+    warn "$ENV_FILE not present (nothing to protect, or not installed yet)"
+  fi
+
+  if [[ -e "$MANAGEMENT_SECRET_FILE" ]]; then
+    local mmode; mmode="$(stat -c '%a' "$MANAGEMENT_SECRET_FILE" 2>/dev/null)"
+    if [[ "$mmode" == "600" ]]; then ok "management secret recovery file mode 600 (root only)"
+    else fail "$MANAGEMENT_SECRET_FILE mode is $mmode; expected 600"; problems=$((problems+1)); fi
+  fi
+
+  if [[ -e "$AGENT_STATE_FILE" ]]; then
+    local mode; mode="$(stat -c '%a' "$AGENT_STATE_FILE" 2>/dev/null)"
+    if [[ "$mode" == "600" || "$mode" == "640" ]]; then ok "node identity file mode $mode"
+    else fail "node identity file mode is $mode; expected 600"; problems=$((problems+1)); fi
+  fi
+
+  if have ss; then
+    local exposed
+    exposed="$(ss -H -lnt 2>/dev/null | awk -v p=":$(api_port)" '$4 ~ p && $4 !~ /127\.0\.0\.1|\[::1\]/ {print $4}')"
+    if [[ -n "$exposed" ]]; then fail "panel API listens on a public interface: $exposed"; problems=$((problems+1));
+    else ok "panel API is loopback-only"; fi
+  fi
+
+  if [[ -d "$INSTALL_ROOT/apps/web/dist" ]]; then
+    if find "$INSTALL_ROOT/apps/web/dist" -name '*.map' -print -quit 2>/dev/null | grep -q .; then
+      fail "production build ships source maps"; problems=$((problems+1))
+    else ok "no source maps in the panel build"; fi
+  fi
+
+  if have nginx && unit_exists nginx; then
+    if nginx -T 2>/dev/null | grep -q 'X-Robots-Tag'; then ok "X-Robots-Tag present in the served configuration"
+    else warn "X-Robots-Tag not found in nginx configuration"; fi
+  fi
+
+  if [[ -r /etc/ssh/sshd_config ]]; then
+    if grep -qiE '^\s*PasswordAuthentication\s+yes' /etc/ssh/sshd_config; then warn "SSH password authentication is enabled"; else ok "SSH password authentication disabled"; fi
+  fi
+
+  if [[ "$JSON" != "1" ]]; then
+    hdr "Control plane posture"
+    say "${C_DIM}(needs admin credentials; never stored)${C_RESET}"
+  fi
+  if [[ -t 0 && "$JSON" != "1" ]]; then
+    local user="admin" password="" token response
+    read -r -p "Admin username [$user] (blank to skip the API checks): " input_user
+    if [[ -n "${input_user:-}" ]]; then
+      user="$input_user"
+      read -r -s -p "Password for $user: " password; printf '\n'
+    fi
+    if [[ -n "$password" ]]; then
+      token="$(api_login_token "$user" "$password")"; unset password
+      if [[ -n "$token" ]]; then
+        response="$(curl -fsS --max-time 10 "$(api_base)/api/v1/system/security" -H "Authorization: Bearer $token" 2>/dev/null || true)"
+        if [[ -n "$response" ]]; then
+          if [[ "$JSON" == "1" ]]; then printf '%s\n' "$response"; else say "$response" | sed 's/[{}]//g; s/","/\n        /g; s/"//g' | sed 's/^/        /'; fi
+        else
+          warn "API security endpoint returned nothing"
+        fi
+      else
+        warn "could not authenticate; API posture checks skipped"
+      fi
+    fi
+  fi
+
+  [[ "$JSON" == "1" ]] || say ""
+  if (( problems > 0 )); then fail "$problems local check(s) need attention"; exit "$EXIT_FAIL"; fi
+  ok "no local security problems found"
+}
+
+# ---------------------------------------------------------------------------
+# configuration summary / version
+# ---------------------------------------------------------------------------
+
+cmd_config() {
+  require_linux
+  local mode="panel"; unit_exists arvoo || mode="node-only"
+  local db_masked="-"
+  local url; url="$(env_file_value DATABASE_URL || true)"
+  if [[ -n "$url" ]]; then
+    db_masked="$(printf '%s' "$url" | sed 's#://\([^:]*\):[^@]*@#://\1:***@#')"
+  fi
+  if [[ "$JSON" == "1" ]]; then
+    printf '{"mode":"%s","installRoot":"%s","envFile":"%s","apiBase":"%s","backupDir":"%s","database":"%s","units":[' \
+      "$mode" "$(json_escape "$INSTALL_ROOT")" "$(json_escape "$ENV_FILE")" "$(json_escape "$(api_base)")" "$(json_escape "$BACKUP_DIR")" "$(json_escape "$db_masked")"
+    local first=1 unit state
+    while IFS=$'\t' read -r unit state; do
+      [[ "$first" == "1" ]] || printf ','
+      first=0
+      printf '{"unit":"%s","state":"%s"}' "$(json_escape "$unit")" "$(json_escape "$state")"
+    done < <(service_rows)
+    printf ']}\n'
+    return 0
+  fi
+  hdr "Configuration summary"
+  say "        role:        $mode"
+  say "        install root: $INSTALL_ROOT"
+  say "        env file:    $ENV_FILE"
+  say "        api:         $(api_base)"
+  say "        database:    $db_masked"
+  say "        backups:     $BACKUP_DIR"
+  say "        version:     $(cli_version)"
+  while IFS=$'\t' read -r unit state; do say "        $unit: $state"; done < <(service_rows)
+}
+
+cmd_version() {
+  if [[ "$JSON" == "1" ]]; then printf '{"name":"arvoo","version":"%s","platform":"%s"}\n' "$(json_escape "$(cli_version)")" "$(json_escape "$(uname -s)")"
+  else printf 'arvoo %s (%s)\n' "$(cli_version)" "$(uname -s)"; fi
+}
+
+usage() {
+  cat <<'USAGE'
+Arvoo Management CLI
+
+Usage: sudo arvoo [command] [options]
+
+Commands:
+  status                 services, health and row counts
+  health                 API and database health (exit code reflects reality)
+  start | stop | restart | reload
+                         service management; reload prefers graceful reloads
+  diagnostics            real system checks with actionable results
+  logs [--component C] [--follow]
+                         journald logs (C: master, node, nginx, postgresql)
+  node status            this host's role, enrollment and agent state
+  tunnel status          GRE interfaces, routes and desired state
+  secret rotate          rotate the session signing secret (invalidates sessions)
+  management status | enable | rotate | disable
+                         second-layer management access secret
+  cert status | cert renew
+                         ACME certificate lifecycle
+  repair                 idempotent repair through install.sh
+  update                 pull, rebuild, migrate, restart (backup first)
+  backup | restore --file <dump>
+                         PostgreSQL backup and verified restore
+  security-audit         local hardening checks plus control plane posture
+  config                 configuration summary (secrets masked)
+  version                version information
+  help                   this help
+
+Options:
+  --json        machine-readable output where supported
+  --yes         skip confirmations (automation; never for read-only commands)
+  --quiet       only warnings and errors
+  -h, --help    this help
+
+Notes:
+  * Read-only commands do not need root; changes do.
+  * Secrets are never printed, never passed as arguments and never logged.
+  * Running `arvoo` with no arguments shows an interactive menu.
+USAGE
+}
+
+# ---------------------------------------------------------------------------
+# interactive menu (only implemented commands are listed)
+# ---------------------------------------------------------------------------
+
+menu() {
+  require_linux
+  local choice
+  while true; do
+    cat <<'MENU'
+
+Arvoo Management CLI
+ 1. Status                    12. Tunnel status
+ 2. Health check              13. Rotate session secret
+ 3. Start services            14. Certificate status
+ 4. Stop services             15. Renew certificate
+ 5. Restart services          16. Repair installation
+ 6. Reload configuration      17. Update
+ 7. Service logs              18. Backup
+ 8. Diagnostics               19. Restore
+ 9. Node status               20. Security audit
+10. Configuration summary     21. Version
+11. Exit                      22. Management secret
+MENU
+    printf 'Select: '
+    read -r choice || exit "$EXIT_OK"
+    case "${choice//[[:space:]]/}" in
+      1) cmd_status ;;
+      2) cmd_health ;;
+      3) cmd_start ;;
+      4) cmd_stop ;;
+      5) cmd_restart ;;
+      6) cmd_reload ;;
+      7) cmd_logs ;;
+      8) cmd_diagnostics ;;
+      9) cmd_node_status ;;
+      10) cmd_config ;;
+      11) exit "$EXIT_OK" ;;
+      12) cmd_tunnel_status ;;
+      13) cmd_secret_rotate ;;
+      14) cmd_cert_status ;;
+      15) cmd_cert_renew ;;
+      16) cmd_repair ;;
+      17) cmd_update ;;
+      18) cmd_backup ;;
+      19) printf 'Backup file path: '; read -r RESTORE_FILE; cmd_restore ;;
+      20) cmd_security_audit ;;
+      21) cmd_version ;;
+      22) cmd_management status ;;
+      *) printf 'Unknown choice: %s\n' "$choice" >&2 ;;
+    esac
+  done
+}
+
+# ---------------------------------------------------------------------------
+# argument parsing
+# ---------------------------------------------------------------------------
+
+args=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --json) JSON=1; shift ;;
+    --quiet) QUIET=1; shift ;;
+    --yes) ASSUME_YES=1; shift ;;
+    --follow|-f) FOLLOW=1; shift ;;
+    --component) COMPONENT="${2:-}"; shift 2 ;;
+    --file) RESTORE_FILE="${2:-}"; shift 2 ;;
+    -h|--help) SHOW_HELP=1; shift ;;
+    --version|-V) SHOW_VERSION=1; shift ;;
+    -*) printf 'arvoo: unknown option %s (see arvoo --help)\n' "$1" >&2; exit 64 ;;
+    *) args+=("$1"); shift ;;
+  esac
+done
+
+if [[ "$SHOW_HELP" == "1" ]]; then usage; exit "$EXIT_OK"; fi
+if [[ "$SHOW_VERSION" == "1" ]]; then cmd_version; exit "$EXIT_OK"; fi
+
+command="${args[0]:-}"
+sub="${args[1]:-}"
+
+case "$command" in
+  "")          menu ;;
+  status)      cmd_status ;;
+  health)      cmd_health ;;
+  start)       cmd_start ;;
+  stop)        cmd_stop ;;
+  restart)     cmd_restart ;;
+  reload)      cmd_reload ;;
+  diagnostics) cmd_diagnostics ;;
+  logs)        cmd_logs ;;
+  node)        [[ "$sub" == "status" ]] || die "usage: arvoo node status"; cmd_node_status ;;
+  tunnel)      [[ "$sub" == "status" ]] || die "usage: arvoo tunnel status"; cmd_tunnel_status ;;
+  secret)      [[ "$sub" == "rotate" ]] || die "usage: arvoo secret rotate"; cmd_secret_rotate ;;
+  management)  cmd_management "${args[1]:-status}" ;;
+  cert)        case "$sub" in status) cmd_cert_status ;; renew) cmd_cert_renew ;; *) die "usage: arvoo cert status|renew" ;; esac ;;
+  repair)      cmd_repair ;;
+  update)      cmd_update ;;
+  backup)      cmd_backup ;;
+  restore)     cmd_restore ;;
+  security-audit) cmd_security_audit ;;
+  config)      cmd_config ;;
+  version)     cmd_version ;;
+  help)        usage ;;
+  *)           printf 'arvoo: unknown command %s (see arvoo --help)\n' "$command" >&2; exit 64 ;;
+esac

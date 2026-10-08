@@ -1,0 +1,256 @@
+<!doctype html>
+<html lang="en" dir="ltr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Arvoo — cloud, connectivity and managed infrastructure</title>
+<meta name="description" content="Arvoo builds and operates cloud compute, managed hosting and private network connectivity for organisations that need to see exactly what runs where.">
+<meta name="theme-color" content="#0e1621">
+<link rel="stylesheet" href="assets/site.css">
+<link rel="canonical" href="https://__SITE_DOMAIN__/">
+</head>
+<body>
+
+<a class="skip" href="#main" data-en="Skip to content" data-fa="رفتن به محتوا">Skip to content</a>
+
+<header class="topbar">
+  <a class="brand" href="#top" aria-label="Arvoo">
+    <span class="brand-mark" aria-hidden="true"></span>
+    <span class="brand-name">Arvoo</span>
+  </a>
+  <nav class="topnav" aria-label="Sections">
+    <a href="#services" data-en="Services" data-fa="سرویس‌ها">Services</a>
+    <a href="#platform" data-en="Platform" data-fa="پلتفرم">Platform</a>
+    <a href="#regions" data-en="Regions" data-fa="مناطق">Regions</a>
+    <a href="#docs" data-en="Documentation" data-fa="مستندات">Documentation</a>
+    <a href="#contact" data-en="Contact" data-fa="تماس">Contact</a>
+  </nav>
+  <button id="lang" class="lang" type="button" aria-label="Switch language">
+    <span data-en="فارسی" data-fa="English">فارسی</span>
+  </button>
+</header>
+
+<main id="main">
+
+  <!-- Hero: the subject's own picture - a routed, hand-built topology - instead
+       of a statistic block. -->
+  <section class="hero" id="top">
+    <div class="hero-copy">
+      <h1 data-en="Infrastructure you can audit." data-fa="زیرساختی که قابل بازبینی است.">Infrastructure you can audit.</h1>
+      <p class="lede"
+         data-en="Arvoo designs, deploys and operates compute, hosting and private connectivity. Every change is planned, applied, verified and written to an audit log — so capacity, access and routing are facts you can check, not promises."
+         data-fa="آروو زیرساخت محاسباتی، میزبانی و اتصال اختصاصی را طراحی، مستقر و اداره می‌کند. هر تغییر برنامه‌ریزی، اعمال، راستی‌آزمایی و در گزارش رویدادها ثبت می‌شود؛ بنابراین ظرفیت، دسترسی و مسیریابی واقعیت‌هایی قابل بررسی‌اند، نه وعده.">
+         Arvoo designs, deploys and operates compute, hosting and private connectivity. Every change is planned, applied, verified and written to an audit log — so capacity, access and routing are facts you can check, not promises.
+      </p>
+      <div class="hero-actions">
+        <a class="button" href="#contact" data-en="Talk to an engineer" data-fa="گفتگو با کارشناس">Talk to an engineer</a>
+        <a class="button ghost" href="#docs" data-en="Read the documentation" data-fa="مطالعه مستندات">Read the documentation</a>
+      </div>
+    </div>
+
+    <figure class="schematic" role="img"
+            aria-label="Schematic of an Arvoo deployment: two edge sites connect over a private backbone to a control plane and a managed database.">
+      <svg viewBox="0 0 520 360" fill="none" stroke-linejoin="round" stroke-linecap="round">
+        <!-- private backbone -->
+        <path class="edge" d="M96 92 C 180 92, 200 160, 260 160" />
+        <path class="edge" d="M96 268 C 180 268, 200 200, 260 200" />
+        <path class="edge" d="M260 160 C 320 160, 340 120, 420 120" />
+        <path class="edge" d="M260 200 C 320 200, 340 240, 420 240" />
+        <path class="edge muted" d="M420 120 L 420 240" />
+        <!-- sites -->
+        <g class="node">
+          <rect x="40" y="66" width="56" height="52" rx="3" />
+          <rect x="40" y="242" width="56" height="52" rx="3" />
+        </g>
+        <g class="node core">
+          <rect x="228" y="134" width="64" height="46" rx="3" />
+          <rect x="228" y="180" width="64" height="46" rx="3" />
+        </g>
+        <g class="node">
+          <rect x="392" y="94" width="88" height="52" rx="3" />
+          <rect x="392" y="214" width="88" height="52" rx="3" />
+        </g>
+        <g class="rules">
+          <line x1="40" y1="336" x2="480" y2="336" />
+          <line x1="40" y1="330" x2="40" y2="342" />
+          <line x1="260" y1="330" x2="260" y2="342" />
+          <line x1="480" y1="330" x2="480" y2="342" />
+        </g>
+      </svg>
+      <figcaption data-en="Edge sites, core routing, managed services — one control plane." data-fa="سایت‌های لبه، مسیریابی مرکزی، سرویس‌های مدیریت‌شده — یک صفحه کنترل.">
+        Edge sites, core routing, managed services — one control plane.
+      </figcaption>
+    </figure>
+  </section>
+
+  <section id="services" class="band">
+    <h2 data-en="What we run" data-fa="آنچه اجرا می‌کنیم">What we run</h2>
+    <ul class="services">
+      <li>
+        <h3 data-en="Cloud compute" data-fa="محاسبات ابری">Cloud compute</h3>
+        <p data-en="Virtual servers and dedicated machines sized to the workload, with storage, snapshots and capacity agreed before it is needed."
+           data-fa="سرورهای مجازی و ماشین‌های اختصاصی متناسب با بار کاری، همراه با ذخیره‌سازی، اسنپ‌شات و ظرفیتی که پیش از نیاز توافق می‌شود.">
+          Virtual servers and dedicated machines sized to the workload, with storage, snapshots and capacity agreed before it is needed.
+        </p>
+      </li>
+      <li>
+        <h3 data-en="Managed hosting" data-fa="میزبانی مدیریت‌شده">Managed hosting</h3>
+        <p data-en="Application, database and web hosting that we operate end to end: OS patching, backups with tested restores, monitoring and on-call response."
+           data-fa="میزبانی برنامه، پایگاه داده و وب که ما کامل اداره می‌کنیم: وصله‌گذاری سیستم‌عامل، پشتیبان‌گیری با بازیابی آزمایش‌شده، پایش و پاسخ‌گویی در زمان بحران.">
+          Application, database and web hosting that we operate end to end: OS patching, backups with tested restores, monitoring and on-call response.
+        </p>
+      </li>
+      <li>
+        <h3 data-en="Private connectivity" data-fa="اتصال اختصاصی">Private connectivity</h3>
+        <p data-en="Encrypted links between your sites and our regions, so application traffic never depends on the public internet. Reachability is measured, not assumed."
+           data-fa="اتصال رمزنگاری‌شده میان سایت‌های شما و مناطق ما، تا ترافیک برنامه‌ها به اینترنت عمومی وابسته نباشد. دسترس‌پذیری اندازه‌گیری می‌شود، نه فرض.">
+          Encrypted links between your sites and our regions, so application traffic never depends on the public internet. Reachability is measured, not assumed.
+        </p>
+      </li>
+      <li>
+        <h3 data-en="Access and identity" data-fa="دسترسی و هویت">Access and identity</h3>
+        <p data-en="Per-user access to the management plane, defined roles, session lifetimes, strong transport security and an immutable record of who changed what."
+           data-fa="دسترسی کاربر‌به‌کاربر به صفحه مدیریت، نقش‌های مشخص، طول عمر نشست، امنیت قوی انتقال و ثبت تغییرناپذیر اینکه چه کسی چه چیزی را تغییر داده است.">
+          Per-user access to the management plane, defined roles, session lifetimes, strong transport security and an immutable record of who changed what.
+        </p>
+      </li>
+      <li>
+        <h3 data-en="Domains and DNS" data-fa="دامنه و DNS">Domains and DNS</h3>
+        <p data-en="Registration, authoritative DNS and certificate lifecycle for the names your services answer on, including automatic renewal that we monitor."
+           data-fa="ثبت دامنه، DNS معتبر و چرخه عمر گواهی برای نام‌هایی که سرویس‌های شما روی آن‌ها پاسخ می‌دهند، همراه با تمدید خودکار که پایش می‌کنیم.">
+          Registration, authoritative DNS and certificate lifecycle for the names your services answer on, including automatic renewal that we monitor.
+        </p>
+      </li>
+      <li>
+        <h3 data-en="Operations and support" data-fa="عملیات و پشتیبانی">Operations and support</h3>
+        <p data-en="Monitoring, alerting, capacity planning and incident handling, with direct contact to the engineers who operate the platform."
+           data-fa="پایش، هشداردهی، برنامه‌ریزی ظرفیت و رسیدگی به رخدادها، با ارتباط مستقیم با مهندسانی که پلتفرم را اداره می‌کنند.">
+          Monitoring, alerting, capacity planning and incident handling, with direct contact to the engineers who operate the platform.
+        </p>
+      </li>
+    </ul>
+  </section>
+
+  <section id="platform" class="band alt">
+    <h2 data-en="How the platform is operated" data-fa="پلتفرم چگونه اداره می‌شود">How the platform is operated</h2>
+    <div class="platform">
+      <div class="steps">
+        <ol>
+          <li>
+            <h3 data-en="Planned and applied" data-fa="برنامه‌ریزی و اعمال">Planned and applied</h3>
+            <p data-en="You describe the desired state in the panel or the CLI; the system validates it, prepares it, applies it, verifies it on the host and only then records it as done."
+               data-fa="شما وضعیت مطلوب را در پنل یا CLI تعیین می‌کنید؛ سیستم آن را اعتبارسنجی، آماده، اعمال و روی سرور راستی‌آزمایی می‌کند و تنها پس از آن به‌عنوان انجام‌شده ثبت می‌کند.">
+              You describe the desired state in the panel or the CLI; the system validates it, prepares it, applies it, verifies it on the host and only then records it as done.
+            </p>
+          </li>
+          <li>
+            <h3 data-en="Verified, not assumed" data-fa="راستی‌آزمایی، نه فرض">Verified, not assumed</h3>
+            <p data-en="Deployments read the real state of the machine back — services, addresses, routes, certificates, processes — and report the actual result, including failure."
+               data-fa="استقرارها وضعیت واقعی ماشین را بازخوانی می‌کنند — سرویس‌ها، نشانی‌ها، مسیرها، گواهی‌ها و فرایندها — و نتیجه واقعی را گزارش می‌دهند، حتی اگر شکست باشد.">
+              Deployments read the real state of the machine back — services, addresses, routes, certificates, processes — and report the actual result, including failure.
+            </p>
+          </li>
+          <li>
+            <h3 data-en="Recoverable" data-fa="قابل بازیابی">Recoverable</h3>
+            <p data-en="Changes that fail are rolled back with a visible report. Backups are taken before risky operations and a restore is rehearsed, not hoped for."
+               data-fa="تغییرات ناموفق با گزارش شفاف بازگردانی می‌شوند. پیش از عملیات پرخطر پشتیبان گرفته می‌شود و بازیابی تمرین می‌شود، نه اینکه به امید بماند.">
+              Changes that fail are rolled back with a visible report. Backups are taken before risky operations and a restore is rehearsed, not hoped for.
+            </p>
+          </li>
+          <li>
+            <h3 data-en="Audited" data-fa="قابل حسابرسی">Audited</h3>
+            <p data-en="Authentication, privilege changes, deployments and credential rotation are logged with actor, time and outcome. Secrets are never written to those logs."
+               data-fa="احراز هویت، تغییر دسترسی‌ها، استقرارها و چرخش اعتبارنامه‌ها با کاربر، زمان و نتیجه ثبت می‌شوند. رمزها هرگز در این گزارش‌ها نوشته نمی‌شوند.">
+              Authentication, privilege changes, deployments and credential rotation are logged with actor, time and outcome. Secrets are never written to those logs.
+            </p>
+          </li>
+        </ol>
+      </div>
+      <aside class="note">
+        <h3 data-en="Continuity" data-fa="تداوم سرویس">Continuity</h3>
+        <p data-en="The platform is built to keep running when parts are unavailable: maintenance work queues and retries, a lost host reconnects and re-synchronises, and the terminal tools keep working when the panel is down."
+           data-fa="پلتفرم طوری ساخته شده که با از کار افتادن بخش‌ها همچنان کار کند: کارهای تعمیراتی صف‌بندی و تکرار می‌شوند، سرور ازدست‌رفته دوباره متصل و همگام می‌شود، و ابزارهای خط فرمان حتی با خاموش بودن پنل کار می‌کنند.">
+          The platform is built to keep running when parts are unavailable: maintenance work queues and retries, a lost host reconnects and re-synchronises, and the terminal tools keep working when the panel is down.
+        </p>
+      </aside>
+    </div>
+  </section>
+
+  <section id="regions" class="band">
+    <h2 data-en="Where we operate" data-fa="کجا فعالیت می‌کنیم">Where we operate</h2>
+    <p class="wide"
+       data-en="Arvoo deployments are single-tenant: capacity, region and connectivity are agreed per engagement, and we confirm what is available before a contract rather than publishing a generic map. Tell us where your users and offices are and we will propose a topology."
+       data-fa="استقرارهای آروو تک‌مستأجری هستند: ظرفیت، منطقه و اتصال برای هر پروژه توافق می‌شود و پیش از قرارداد، موجود بودن را تأیید می‌کنیم؛ نقشه عمومی منتشر نمی‌کنیم. بگویید کاربران و دفاتر شما کجا هستند تا معماری پیشنهادی ارائه کنیم.">
+      Arvoo deployments are single-tenant: capacity, region and connectivity are agreed per engagement, and we confirm what is available before a contract rather than publishing a generic map. Tell us where your users and offices are and we will propose a topology.
+    </p>
+  </section>
+
+  <section id="status" class="band alt">
+    <h2 data-en="Service status" data-fa="وضعیت سرویس">Service status</h2>
+    <p class="wide"
+       data-en="Status is not decorative here. Customers receive the live health endpoint of their own deployment, so availability is read from the same system that runs their services — not from a separate page that can disagree with reality."
+       data-fa="وضعیت سرویس در اینجا تزئینی نیست. مشتریان نشانی سلامت زنده استقرار خود را دریافت می‌کنند؛ بنابراین دسترس‌پذیری از همان سیستمی خوانده می‌شود که سرویس‌ها را اجرا می‌کند، نه از صفحه‌ای جدا که ممکن است با واقعیت اختلاف داشته باشد.">
+      Status is not decorative here. Customers receive the live health endpoint of their own deployment, so availability is read from the same system that runs their services — not from a separate page that can disagree with reality.
+    </p>
+    <p class="wide small" data-en="Already a customer? Check your deployment's health from the panel or run:"
+       data-fa="مشتری هستید؟ سلامت استقرار خود را از پنل بررسی کنید یا این فرمان را اجرا کنید:">
+      Already a customer? Check your deployment's health from the panel or run:
+    </p>
+    <pre class="code"><code>arvoo health</code></pre>
+  </section>
+
+  <section id="docs" class="band">
+    <h2 data-en="Documentation" data-fa="مستندات">Documentation</h2>
+    <p class="wide"
+       data-en="Installation is one command on Ubuntu 24.04, and the same installer repairs, updates, backs up and diagnoses an existing deployment. The command-line tools mirror the panel, so an outage in the web interface never blocks operations."
+       data-fa="نصب روی اوبونتو ۲۴.۰۴ با یک فرمان انجام می‌شود و همان نصب‌کننده، تعمیر، به‌روزرسانی، پشتیبان‌گیری و عیب‌یابی استقرار موجود را انجام می‌دهد. ابزارهای خط فرمان آینه‌ی پنل هستند، پس قطعی رابط وب هرگز مانع عملیات نمی‌شود.">
+      Installation is one command on Ubuntu 24.04, and the same installer repairs, updates, backs up and diagnoses an existing deployment. The command-line tools mirror the panel, so an outage in the web interface never blocks operations.
+    </p>
+    <div class="docs">
+      <div>
+        <h3 data-en="Deploy" data-fa="استقرار">Deploy</h3>
+        <pre class="code"><code>sudo ./install.sh
+# 1 Master / Panel   2 Node Agent
+# 3 Repair   4 Update
+# 5 Diagnostics   6 Uninstall</code></pre>
+      </div>
+      <div>
+        <h3 data-en="Operate" data-fa="بهره‌برداری">Operate</h3>
+        <pre class="code"><code>arvoo status
+arvoo diagnostics
+arvoo logs --component master --follow
+arvoo backup   /   arvoo restore --file …</code></pre>
+      </div>
+      <div>
+        <h3 data-en="Secure" data-fa="امنیت">Secure</h3>
+        <pre class="code"><code>arvoo secret rotate
+arvoo cert status
+arvoo security-audit
+arvoo management status</code></pre>
+      </div>
+    </div>
+  </section>
+
+  <section id="contact" class="band alt">
+    <h2 data-en="Talk to us" data-fa="با ما در تماس باشید">Talk to us</h2>
+    <p class="wide"
+       data-en="Write to us with the workload, the locations involved and the constraints you have to respect. We answer with a concrete topology, the capacity it needs and what it costs."
+       data-fa="برای ما بنویسید: بار کاری، مکان‌های دخیل و محدودیت‌هایی که باید رعایت شود. ما با یک معماری مشخص، ظرفیت موردنیاز و هزینه آن پاسخ می‌دهیم.">
+      Write to us with the workload, the locations involved and the constraints you have to respect. We answer with a concrete topology, the capacity it needs and what it costs.
+    </p>
+    <p class="contact-line"><a class="button" href="mailto:__CONTACT_EMAIL__">__CONTACT_EMAIL__</a></p>
+  </section>
+
+</main>
+
+<footer class="footer">
+  <p data-en="Arvoo — cloud, connectivity and managed infrastructure." data-fa="آروو — ابر، اتصال و زیرساخت مدیریت‌شده.">Arvoo — cloud, connectivity and managed infrastructure.</p>
+  <p class="fine" data-en="This site does not collect credentials and has no client login. Customer management is reachable only from your own deployment."
+     data-fa="این سایت هیچ اعتبارنامه‌ای جمع‌آوری نمی‌کند و ورود مشتری ندارد. مدیریت مشتریان تنها از استقرار اختصاصی شما در دسترس است.">
+    This site does not collect credentials and has no client login. Customer management is reachable only from your own deployment.
+  </p>
+</footer>
+
+<script src="assets/site.js" defer></script>
+</body>
+</html>

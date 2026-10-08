@@ -1,0 +1,20 @@
+{
+  "_comment": "Contract for status.json. Generate the real file with scripts/endpoint-status.sh on the server; copy this file to status.json only to preview the layout locally, and never ship example numbers to production.",
+  "generatedAt": "2026-10-08T00:00:00Z",
+  "listeners": [
+    { "service": "xray-vless", "protocol": "tcp", "port": 443, "status": "listening" },
+    { "service": "wireguard", "protocol": "udp", "port": 51820, "status": "listening" },
+    { "service": "arvoo-web", "protocol": "tcp", "port": 8080, "status": "listening" }
+  ],
+  "certificates": [
+    { "name": "edge.example", "path": "/etc/letsencrypt/live/edge.example/fullchain.pem", "expiresAt": "2026-12-30T00:00:00Z", "daysLeft": 83 }
+  ],
+  "web": { "status": "ok", "path": "/" },
+  "nodes": [
+    { "name": "IR-01", "location": "Tehran, IR", "role": "ingress", "status": "online" },
+    { "name": "DE-01", "location": "Falkenstein, DE", "role": "egress", "status": "online" },
+    { "name": "DE-02", "location": "Nuremberg, DE", "role": "egress", "status": "degraded" }
+  ],
+  "contact": "ops@example.invalid",
+  "docs": "https://docs.example.invalid/"
+}
