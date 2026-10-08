@@ -1,6 +1,6 @@
 import { q, q1, run, uuid, nowIso } from "../db/index.js";
 import type { GreOpInput, IPsecOpInput, TunnelRecord } from "@arvoo/shared";
-import { computeGreMtu, carve30, ipToInt } from "@arvoo/shared";
+import { computeGreMtu, carve30, ipToInt, canonicalGreKey, greKeyFromBytes, GRE_KEY_RULE } from "@arvoo/shared";
 import { badRequest, conflict, notFound, unprocessable } from "../lib/errors.js";
 import { enqueueOperation, logOperation } from "./operations.js";
 import { raiseAlert, resolveAlerts } from "./alerts.js";
@@ -91,7 +91,8 @@ export interface CreateTunnelInput {
   name: string;
   sourceNodeId: string;
   destNodeId: string;
-  key?: boolean | null;
+  /** true/omitted = generate a key, false = keyless, string = operator-supplied hex key. */
+  key?: boolean | string | null;
   ttl?: number;
   mtuOverride?: number | null;
   pathMtu?: number;
@@ -124,6 +125,31 @@ export async function assertNodeSupportsEncap(nodeId: string, encap: { fou: bool
   if (encap.ipsec && caps.ipsec?.available !== true) {
     throw unprocessable(`Node ${row.name} does not have a working strongSwan/IPsec stack, so GRE over IPsec is unavailable.`);
   }
+}
+
+/**
+ * Resolve the GRE key of a new tunnel:
+ *   * true / omitted / null - generate a fresh random 32-bit key
+ *   * false                 - no key field at all (keyless GRE)
+ *   * string                - an operator-supplied key, canonicalised
+ *
+ * An invalid key is refused here, so nothing invalid can reach the tunnels row
+ * or the CreateGRE payload. This is the single generation point: the legacy
+ * `String(Math.abs(ipToInt(localTunnelIp)) % 2147483647)` produced a DECIMAL
+ * integer (10.200.0.1 -> "180879361"), which is nine characters and not a hex
+ * key, so the agent rejected the operation and the tunnel never came up.
+ */
+export function resolveGreKey(requested: CreateTunnelInput["key"]): string | null {
+  if (requested === false) return null;
+  if (typeof requested === "string") {
+    const canonical = canonicalGreKey(requested);
+    if (canonical === null) throw badRequest(`Invalid GRE key "${requested}": must be ${GRE_KEY_RULE}.`);
+    return canonical;
+  }
+  // A GRE key identifies the tunnel's traffic; it is not a secret. It is random
+  // so two tunnels never share a key by accident, and it is stored, so both ends
+  // and every re-deploy use exactly the same 32-bit value.
+  return greKeyFromBytes(randomBytes(4));
 }
 
 export async function createTunnel(input: CreateTunnelInput, actor: { id: string; name: string }): Promise<TunnelRecord> {
@@ -173,7 +199,8 @@ export async function createTunnel(input: CreateTunnelInput, actor: { id: string
 
   // MTU engine: keyed GRE over the physical path, with the real overhead of
   // every encapsulation layer this tunnel uses (FOU adds UDP, IPsec adds ESP).
-  const keyed = input.key !== false;
+  const key = resolveGreKey(input.key);
+  const keyed = key !== null;
   const pathMtu = input.pathMtu ?? 1500;
   const engine = computeGreMtu(pathMtu, { keyed, fou: fouPort != null, ipsec });
   const mtu = input.mtuOverride ?? engine.mtu;
@@ -195,7 +222,7 @@ export async function createTunnel(input: CreateTunnelInput, actor: { id: string
     remote,
     mtu,
     ttl,
-    keyed ? String(Math.abs(ipToInt(local)) % 2147483647) : null,
+    key,
     fouPort,
     ipsec ? 1 : 0,
     now,

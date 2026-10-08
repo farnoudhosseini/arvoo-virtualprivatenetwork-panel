@@ -1173,7 +1173,15 @@ export function registerRoutes(app: FastifyInstance): void {
         .max(15, "Tunnel name must be 3-15 characters: it becomes the Linux interface name on each node."),
       sourceNodeId: z.string().uuid(),
       destNodeId: z.string().uuid(),
-      key: z.boolean().nullable().optional(),
+      // true/omitted: generate a key. false: keyless GRE. A string is used as the
+      // key itself and canonicalised (1-8 hexadecimal characters); anything else
+      // is refused by the service before it can be queued.
+      key: z
+        // The length bound is deliberately loose: the service owns the rule and
+        // answers with the exact hexadecimal requirement for any bad value.
+        .union([z.boolean(), z.string().min(1).max(32)])
+        .nullable()
+        .optional(),
       ttl: z.number().int().min(1).max(255).optional(),
       mtuOverride: z.number().int().min(576).max(1500).nullable().optional(),
       pathMtu: z.number().int().min(576).max(1500).optional(),

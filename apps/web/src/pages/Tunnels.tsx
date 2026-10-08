@@ -4,7 +4,7 @@ import { useNavigate, useSearchParams } from "react-router-dom";
 import { toast } from "sonner";
 import { LayoutGrid, List, Network, Plus, RefreshCw, Search, ShieldAlert, Trash2, X } from "lucide-react";
 import { api } from "../lib/api";
-import type { TunnelRecord } from "@arvoo/shared";
+import { GRE_KEY_RULE, canonicalGreKey, type TunnelRecord } from "@arvoo/shared";
 import {
   Badge, Button, Card, EmptyState, Field, Input, PageHeader, Select, UnifiedStatus, cx,
 } from "../components/ui/primitives";
@@ -278,9 +278,11 @@ function NewTunnelDrawer({ open, onClose, onCreated }: { open: boolean; onClose:
     enabled: open,
   });
   const [pathMtu, setPathMtu] = useState("1500");
+  const [keyMode, setKeyMode] = useState<"auto" | "custom" | "none">("auto");
+  const [customKey, setCustomKey] = useState("");
   const { data: advice } = useQuery({
-    queryKey: ["mtu-advice", pathMtu],
-    queryFn: () => api.get<{ recommendedMtu: number; recommendedMss: number; explanation: string[] }>(`/tunnels/mtu-advice?pathMtu=${pathMtu}&keyed=true`),
+    queryKey: ["mtu-advice", pathMtu, keyMode],
+    queryFn: () => api.get<{ recommendedMtu: number; recommendedMss: number; explanation: string[] }>(`/tunnels/mtu-advice?pathMtu=${pathMtu}&keyed=${keyMode !== "none"}`),
     enabled: open,
   });
 
@@ -288,18 +290,27 @@ function NewTunnelDrawer({ open, onClose, onCreated }: { open: boolean; onClose:
   const [name, setName] = useState("");
   const [source, setSource] = useState("");
   const [dest, setDest] = useState("");
-  const [keyed, setKeyed] = useState(true);
   const [mtuOverride, setMtuOverride] = useState("");
   const [submitting, setSubmitting] = useState(false);
 
+  // The API canonicalises the key as well; checking here keeps an invalid value
+  // from ever being submitted, and shows the operator the exact hex key that
+  // will be applied on both nodes.
+  const canonicalKey = canonicalGreKey(customKey);
+  const customKeyInvalid = keyMode === "custom" && canonicalKey === null;
+
   const submit = async () => {
+    if (customKeyInvalid) {
+      toast.error(`GRE key must be ${GRE_KEY_RULE}.`);
+      return;
+    }
     setSubmitting(true);
     try {
       const res = await api.post<{ tunnel: TunnelRecord }>("/tunnels", {
         name: name.trim(),
         sourceNodeId: source,
         destNodeId: dest,
-        key: keyed,
+        key: keyMode === "none" ? false : keyMode === "custom" ? canonicalKey : true,
         pathMtu: Number(pathMtu) || 1500,
         mtuOverride: mtuOverride ? Number(mtuOverride) : null,
       });
@@ -325,7 +336,12 @@ function NewTunnelDrawer({ open, onClose, onCreated }: { open: boolean; onClose:
           <Button variant="ghost" onClick={onClose}>
             Cancel
           </Button>
-          <Button variant="primary" onClick={submit} loading={submitting} disabled={!name.trim() || !source || !dest}>
+          <Button
+            variant="primary"
+            onClick={submit}
+            loading={submitting}
+            disabled={!name.trim() || !source || !dest || customKeyInvalid}
+          >
             Create & deploy both sides
           </Button>
         </>
@@ -339,12 +355,34 @@ function NewTunnelDrawer({ open, onClose, onCreated }: { open: boolean; onClose:
               <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="ir-de-01" maxLength={15} className="mono" autoFocus />
             </Field>
             <Field label="GRE key" hint="Keys the encapsulation — it is not encryption">
-              <Select value={keyed ? "1" : "0"} onChange={(e) => setKeyed(e.target.value === "1")}>
-                <option value="1">Auto-generated key</option>
-                <option value="0">No key</option>
+              <Select
+                value={keyMode}
+                onChange={(e) => setKeyMode(e.target.value as "auto" | "custom" | "none")}
+              >
+                <option value="auto">Auto-generated key</option>
+                <option value="custom">Custom key (hexadecimal)</option>
+                <option value="none">No key</option>
               </Select>
             </Field>
           </div>
+
+          {keyMode === "custom" && (
+            <Field label="Custom GRE key" required hint="1-8 hexadecimal digits, case-insensitive (0 to ffffffff)">
+              <Input
+                value={customKey}
+                onChange={(e) => setCustomKey(e.target.value)}
+                placeholder="ac80001"
+                maxLength={10}
+                className="mono"
+                aria-invalid={customKeyInvalid}
+              />
+              <p className={cx("mt-1 text-2xs", customKeyInvalid ? "text-danger" : "text-faint")}>
+                {canonicalKey !== null
+                  ? `Applied as 0x${canonicalKey} (decimal ${parseInt(canonicalKey, 16)}).`
+                  : `Must be ${GRE_KEY_RULE}.`}
+              </p>
+            </Field>
+          )}
 
           {eligible.length < 2 && (
             <p className="rounded-default border border-warning/25 bg-warning-soft px-3 py-2 text-2xs leading-relaxed text-warning">
@@ -382,7 +420,7 @@ function NewTunnelDrawer({ open, onClose, onCreated }: { open: boolean; onClose:
               <LinkDiagram
                 compact
                 status="planned"
-                label={keyed ? "GRE · keyed" : "GRE"}
+                label={keyMode !== "none" ? "GRE · keyed" : "GRE"}
                 source={{ name: eligible.find((n) => n.id === source)?.name ?? "source", address: eligible.find((n) => n.id === source)?.address ?? null }}
                 dest={{ name: eligible.find((n) => n.id === dest)?.name ?? "destination", address: eligible.find((n) => n.id === dest)?.address ?? null }}
               />

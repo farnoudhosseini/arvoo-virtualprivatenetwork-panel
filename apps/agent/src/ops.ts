@@ -19,6 +19,7 @@ import type {
   OpenVPNOpInput,
   TunnelTestResult,
 } from "@arvoo/shared";
+import { GRE_KEY_RULE, canonicalGreKey, greKeyCliValue, greKeyFromLinkShow } from "@arvoo/shared";
 import { applyFirewallPlan, ufwAvailable } from "./ufw.js";
 import { exec } from "./linux.js";
 
@@ -88,15 +89,44 @@ async function ensureIpForward(): Promise<string | null> {
 // GRE
 // ---------------------------------------------------------------------------
 
+/**
+ * The `ip link add` argv for a GRE interface, key field included. Pure, so the
+ * exact command - and the exact spelling of the key - can be asserted in tests
+ * without root. `canonicalKey` is the validated 32-bit key or null.
+ */
+export function greLinkArgs(input: GreOpInput, canonicalKey: string | null): string[] {
+  const args = [
+    "link",
+    "add",
+    input.interfaceName,
+    "type",
+    "gre",
+    "local",
+    input.localEndpoint,
+    "remote",
+    input.remoteEndpoint,
+    "ttl",
+    String(input.ttl),
+  ];
+  if (canonicalKey !== null) args.push("key", greKeyCliValue(canonicalKey)!);
+  return args;
+}
+
 export async function applyGre(input: GreOpInput): Promise<OpResult> {
   if (process.platform !== "linux") return requiresLinux();
+
+  // Canonical payload from the control plane (validated again in validate-op.ts);
+  // iproute2 parses `key` with base 0, so the hex value is passed 0x-prefixed to
+  // keep the exact 32-bit field instead of being read as a decimal number.
+  const canonicalKey = input.key === null || input.key === undefined ? null : canonicalGreKey(input.key);
+  if (canonicalKey === null && input.key !== null && input.key !== undefined) {
+    return { success: false, error: `key must be ${GRE_KEY_RULE}` };
+  }
 
   // Idempotent: remove pre-existing interface of the same name first
   await exec("ip", ["link", "del", input.interfaceName], 5000).catch(() => undefined);
 
-  const args: string[] = ["link", "add", input.interfaceName, "type", "gre",
-    "local", input.localEndpoint, "remote", input.remoteEndpoint, "ttl", String(input.ttl)];
-  if (input.key) args.push("key", input.key);
+  const args = greLinkArgs(input, canonicalKey);
 
   if (input.fouPort != null) {
     // GRE over FOU: the kernel sends GRE inside UDP on the given port. The FOU
@@ -145,9 +175,21 @@ export async function applyGre(input: GreOpInput): Promise<OpResult> {
     // persistence best-effort; runtime state still applied
   }
 
-  // In-place verification: interface present + ping across the tunnel
-  const link = await exec("ip", ["link", "show", input.interfaceName]);
+  // In-place verification: the interface exists, the kernel installed the key we
+  // asked for, and ping crosses the tunnel. `-d` is needed to see the key field.
+  const link = await exec("ip", ["-d", "link", "show", input.interfaceName]);
   if (link.code !== 0) return { success: false, error: "Interface not present after creation" };
+
+  // Read the key back from the kernel: a key that was parsed differently (for
+  // example a decimal number read as hex) must be reported, not assumed.
+  const observedKey = greKeyFromLinkShow(link.stdout);
+  if (canonicalKey !== null && observedKey !== null && observedKey !== canonicalKey) {
+    return {
+      success: false,
+      error: `Kernel installed GRE key ${observedKey} but ${canonicalKey} was requested`,
+    };
+  }
+  const keyVerified = canonicalKey === null ? null : observedKey !== null && observedKey === canonicalKey;
 
   const ping = await exec("ping", ["-c", "3", "-W", "2", "-I", input.interfaceName, input.remoteTunnelIp], 15000);
   const lossMatch = ping.stdout.match(/(\d+(?:\.\d+)?)% packet loss/);
@@ -166,6 +208,8 @@ export async function applyGre(input: GreOpInput): Promise<OpResult> {
       interfacePresent: true,
       pingOk,
       mtuDetected: input.mtu,
+      key: canonicalKey,
+      keyVerified,
       error: pingOk ? null : "ping across tunnel failed",
     } satisfies TunnelTestResult & { ok: boolean },
   };

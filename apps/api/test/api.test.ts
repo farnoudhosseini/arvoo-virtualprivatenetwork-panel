@@ -1422,3 +1422,102 @@ describe("managed firewall (§UFW)", () => {
     expect(res.statusCode).toBe(401);
   });
 });
+
+describe("GRE keys (generation, validation, queue payload)", () => {
+  let sourceNodeId = "";
+  let destNodeId = "";
+  const created: string[] = [];
+
+  beforeAll(async () => {
+    const { run, nowIso } = await import("../src/db/index.js");
+    for (const [name, address] of [
+      ["GK-01", "203.0.113.51"],
+      ["GK-02", "203.0.113.52"],
+    ] as const) {
+      const res = await api("POST", "/api/v1/nodes", { name, role: "vpn", regionClass: "iran", country: "Iran", provider: "dc-ir" });
+      expect(res.statusCode).toBe(200);
+      const id = res.json().node.id as string;
+      await run(
+        `UPDATE nodes SET enrollment_state = 'approved', status = 'online', address = ?, capabilities = ?, capabilities_at = ? WHERE id = ?`,
+        address,
+        JSON.stringify({ gre: true, fou: false, ipsec: { available: false, tool: null, version: null }, nftables: true, dco: { supported: false, reason: "test" }, openvpnVersion: "2.6.12", kernel: "6.8.0" }),
+        nowIso(),
+        id,
+      );
+      if (name === "GK-01") sourceNodeId = id;
+      else destNodeId = id;
+    }
+  });
+
+  afterAll(async () => {
+    for (const id of created) await api("DELETE", `/api/v1/tunnels/${id}`);
+  });
+
+  it("refuses the decimal key the old generator produced, before it can be queued", async () => {
+    const res = await api("POST", "/api/v1/tunnels", {
+      name: "gk-bad1",
+      sourceNodeId,
+      destNodeId,
+      key: "180879361",
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error.message).toMatch(/hexadecimal/i);
+    // Nothing was created, so nothing can be queued for a node.
+    const { q } = await import("../src/db/index.js");
+    const rows = await q<{ id: string }>(`SELECT id FROM tunnels WHERE name = 'gk-bad1'`);
+    expect(rows).toHaveLength(0);
+  });
+
+  it("refuses a 9-digit key, a non-hex key and an out-of-range key", async () => {
+    for (const key of ["100000000", "G1234567", "1000000000", "0x100000000"]) {
+      const res = await api("POST", "/api/v1/tunnels", { name: "gk-bad2", sourceNodeId, destNodeId, key });
+      expect(res.statusCode).toBe(400);
+      expect(res.json().error.message).toMatch(/hexadecimal/i);
+    }
+  });
+
+  it("generates a valid canonical key by default", async () => {
+    const res = await api("POST", "/api/v1/tunnels", { name: "gk-auto", sourceNodeId, destNodeId });
+    expect(res.statusCode).toBe(200);
+    const tunnel = res.json().tunnel as { id: string; key: string | null };
+    created.push(tunnel.id);
+    expect(tunnel.key).toMatch(/^[0-9a-f]{1,8}$/);
+    // The regression: a 9-character decimal string must never be generated again.
+    expect(tunnel.key!.length).toBeLessThanOrEqual(8);
+    expect(tunnel.key).not.toBe("180879361");
+  });
+
+  it("stores an operator-supplied key in canonical form and queues it to both nodes", async () => {
+    const res = await api("POST", "/api/v1/tunnels", {
+      name: "gk-custom",
+      sourceNodeId,
+      destNodeId,
+      key: "0xAC80001",
+    });
+    expect(res.statusCode).toBe(200);
+    const tunnel = res.json().tunnel as { id: string; key: string | null };
+    created.push(tunnel.id);
+    expect(tunnel.key).toBe("ac80001");
+
+    const { q } = await import("../src/db/index.js");
+    const ops = await q<{ node_id: string; input: string }>(
+      `SELECT node_id, input FROM operations WHERE ref_type = 'tunnel' AND ref_id = ? AND type = 'CreateGRE'`,
+      tunnel.id,
+    );
+    expect(ops).toHaveLength(2);
+    for (const op of ops) {
+      const input = JSON.parse(op.input) as { key: string | null; interfaceName: string };
+      expect(input.interfaceName).toBe("gk-custom");
+      expect(input.key).toBe("ac80001");
+    }
+    expect(new Set(ops.map((o) => o.node_id))).toEqual(new Set([sourceNodeId, destNodeId]));
+  });
+
+  it("creates a keyless tunnel when the key is switched off", async () => {
+    const res = await api("POST", "/api/v1/tunnels", { name: "gk-none", sourceNodeId, destNodeId, key: false });
+    expect(res.statusCode).toBe(200);
+    const tunnel = res.json().tunnel as { id: string; key: string | null };
+    created.push(tunnel.id);
+    expect(tunnel.key).toBeNull();
+  });
+});

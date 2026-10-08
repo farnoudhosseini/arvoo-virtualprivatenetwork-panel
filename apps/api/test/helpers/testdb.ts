@@ -5,6 +5,7 @@
  * `?`→`$n` placeholder translation, tx() and the SQL migration runner.
  */
 import { mkdtempSync, rmSync } from "node:fs";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import EmbeddedPostgres from "embedded-postgres";
@@ -19,6 +20,24 @@ const TEST_DB_PORT = 54329;
 const TEST_DB_NAME = "arvoo_test";
 
 let shared: TestDatabase | null = null;
+
+/**
+ * A port that is free right now. Test clusters must not hardcode one: a
+ * developer's own database (or a cluster left behind by an aborted run) is
+ * already listening on the "private" port often enough to make the suite red for
+ * reasons that have nothing to do with the code under test.
+ */
+export async function findFreePort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const server = createServer();
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      const port = typeof address === "object" && address ? address.port : 0;
+      server.close(() => (port > 0 ? resolve(port) : reject(new Error("could not allocate a free port"))));
+    });
+  });
+}
 
 /**
  * Boot an independent PostgreSQL server on a private port and create a database

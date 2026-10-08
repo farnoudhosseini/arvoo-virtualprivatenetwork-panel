@@ -108,8 +108,28 @@ describe("validateOperationInput: malformed values are refused", () => {
     expect(validateOperationInput("CreateGRE", { ...validGre, tunnelNetwork: "10.10.0.0" })).toMatch(/tunnelNetwork/);
   });
 
-  it("rejects a GRE key that is not hexadecimal", () => {
-    expect(validateOperationInput("CreateGRE", { ...validGre, key: "zzzz" })).toMatch(/key/);
+  it("accepts every canonical GRE key, whatever the case", () => {
+    for (const key of ["1", "a", "0", "ac80001", "1a2b3c4d", "ffffffff", "1A2B3C4D", "0xAC80001"]) {
+      expect(validateOperationInput("CreateGRE", { ...validGre, key })).toBeNull();
+    }
+  });
+
+  it("rejects a GRE key that is not a hexadecimal 32-bit value", () => {
+    for (const key of [
+      "zzzz", // not hex
+      "G1234567", // not hex
+      "100000000", // 9 characters
+      "180879361", // the decimal key the old generator produced
+      "4294967296", // one past ffffffff
+      "", // empty
+    ]) {
+      expect(validateOperationInput("CreateGRE", { ...validGre, key })).toMatch(/key/);
+    }
+  });
+
+  it("rejects a GRE key that is not a string", () => {
+    expect(validateOperationInput("CreateGRE", { ...validGre, key: 26 })).toMatch(/key/);
+    expect(validateOperationInput("CreateGRE", { ...validGre, key: {} })).toMatch(/key/);
   });
 
   it("rejects routes with a bad destination or device", () => {

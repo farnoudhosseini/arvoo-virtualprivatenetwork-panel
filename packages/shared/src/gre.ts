@@ -84,3 +84,98 @@ export function validateGreName(name: string): string | null {
   }
   return null;
 }
+
+// ---------------------------------------------------------------------------
+// GRE keys
+// ---------------------------------------------------------------------------
+/**
+ * GRE carries an optional 32-bit key field (RFC 2890). Control plane, node agent
+ * and UI agree on exactly one canonical representation:
+ *
+ *   lowercase hexadecimal, 1-8 characters, no `0x` prefix, no leading zeros -
+ *   the minimal hex spelling of the unsigned 32-bit value.
+ *
+ * `0` and `ffffffff` are both real keys, so "no key" is null and never the empty
+ * string. Operators may type the canonical form case-insensitively, with or
+ * without a `0x` prefix; the control plane canonicalises it before storing or
+ * queueing it.
+ *
+ * A decimal integer is NOT a key: 180879361 is what the original generator
+ * produced for the tunnel address 10.200.0.1, and the agent - correctly - refused
+ * to hand nine decimal digits to the kernel. Use `canonicalGreKeyFromDecimal()`
+ * for values written by that generator.
+ */
+export const GRE_KEY_MAX = 0xffffffff;
+
+/** Canonical form: what the database, the operation queue and the UI carry. */
+export const CANONICAL_GRE_KEY_RE = /^[0-9a-f]{1,8}$/;
+
+/** Operator input: the canonical form, case-insensitively, optionally 0x-prefixed. */
+export const GRE_KEY_INPUT_RE = /^(?:0[xX])?[0-9a-fA-F]{1,8}$/;
+
+/** Single wording for the rule, shared by the API validator and the node agent. */
+export const GRE_KEY_RULE = '1-8 hexadecimal digits (case-insensitive, max "ffffffff"), e.g. "ac80001"';
+
+/** True for the canonical representation (lowercase hex, 1-8 characters). */
+export function isValidGreKey(value: unknown): value is string {
+  return typeof value === "string" && CANONICAL_GRE_KEY_RE.test(value);
+}
+
+/**
+ * Canonicalise a key from operator input, a queued payload or a legacy value.
+ * Returns null when the value is not a representable 32-bit key. Digits are read
+ * as hex digits, which is the only reading consistent with the canonical form.
+ */
+export function canonicalGreKey(value: unknown): string | null {
+  if (typeof value === "number") {
+    return Number.isInteger(value) && value >= 0 && value <= GRE_KEY_MAX ? value.toString(16) : null;
+  }
+  if (typeof value !== "string") return null;
+  const raw = value.trim();
+  if (!GRE_KEY_INPUT_RE.test(raw)) return null;
+  const hex = raw.replace(/^0x/i, "").toLowerCase().replace(/^0+/, "");
+  return hex === "" ? "0" : hex;
+}
+
+/**
+ * The argument handed to `ip link add ... key`: iproute2 parses tunnel keys with
+ * base 0, so a bare hex string containing letters is rejected and a digits-only
+ * string would be read as decimal. `0x` + canonical hex is unambiguous and keeps
+ * the exact 32-bit value.
+ */
+export function greKeyCliValue(key: unknown): string | null {
+  const canonical = canonicalGreKey(key);
+  return canonical === null ? null : `0x${canonical}`;
+}
+
+/** A key built from 4 big-endian bytes (the API uses crypto.randomBytes(4)). */
+export function greKeyFromBytes(bytes: Uint8Array): string {
+  if (bytes.length !== 4) throw new Error("a GRE key is exactly 4 bytes");
+  const value = ((bytes[0]! << 24) | (bytes[1]! << 16) | (bytes[2]! << 8) | bytes[3]!) >>> 0;
+  return value.toString(16);
+}
+
+/**
+ * Convert a value the pre-0005 generator stored as a DECIMAL integer into the
+ * canonical hex form without changing the key: 180879361 and "ac80001" are the
+ * same 32-bit key field, only spelled differently. Returns null when the value is
+ * not an unsigned 32-bit integer.
+ */
+export function canonicalGreKeyFromDecimal(value: string | number): string | null {
+  if (typeof value === "string" && value.trim() === "") return null;
+  const n = typeof value === "number" ? value : Number(value.trim());
+  if (!Number.isInteger(n) || n < 0 || n > GRE_KEY_MAX) return null;
+  return n.toString(16);
+}
+
+/**
+ * Read the key the kernel reports for an interface (`ip -d link show`). Handles
+ * both print styles iproute2 has used (`key ac80001`, `key 0xac80001`) without
+ * touching `ikey`/`okey`, and returns the canonical form or null when the link
+ * dump does not carry a key.
+ */
+export function greKeyFromLinkShow(stdout: string): string | null {
+  const match = stdout.match(/(?:^|\s)key\s+(?:0x)?([0-9a-fA-F]{1,8})(?=\s|$)/);
+  if (!match) return null;
+  return canonicalGreKey(match[1]);
+}

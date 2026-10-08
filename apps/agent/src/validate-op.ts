@@ -11,6 +11,8 @@
  * Every check is a pure function so it can be unit-tested without root.
  */
 
+import { GRE_KEY_RULE, canonicalGreKey } from "@arvoo/shared";
+
 type Rec = Record<string, unknown>;
 
 function asObject(value: unknown): Rec | null {
@@ -20,7 +22,6 @@ function asObject(value: unknown): Rec | null {
 
 const IPV4_RE = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;
 const CIDR_RE = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\/(\d{1,2})$/;
-const GRE_KEY_RE = /^[0-9a-fA-F]{1,8}$/;
 
 function isIpv4(value: unknown): value is string {
   if (typeof value !== "string") return false;
@@ -190,11 +191,14 @@ export function validateOperationInput(type: string, raw: unknown): string | nul
         checkInt(input.mtu, "mtu", 576, 1500) ??
         checkInt(input.ttl, "ttl", 1, 255) ??
         (input.fouPort === null || input.fouPort === undefined ? null : checkInt(input.fouPort, "fouPort", 1024, 65535)) ??
+        // The control plane canonicalises GRE keys; the agent re-checks the same
+        // shared rule so a decimal integer like 180879361 (the historical
+        // generator bug) can never reach `ip link add ... key`.
         (input.key === null || input.key === undefined
           ? null
-          : typeof input.key === "string" && GRE_KEY_RE.test(input.key)
+          : typeof input.key === "string" && canonicalGreKey(input.key) !== null
             ? null
-            : "key must be a 1-8 digit hexadecimal GRE key") ??
+            : `key must be ${GRE_KEY_RULE}`) ??
         checkRoutes(input.routes)
       );
     }

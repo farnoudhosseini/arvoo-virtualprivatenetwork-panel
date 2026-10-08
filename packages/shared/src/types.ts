@@ -415,6 +415,10 @@ export interface TunnelRecord {
   remoteTunnelIp: string;
   mtu: number;
   ttl: number;
+  /**
+   * GRE key field in its canonical form: lowercase hexadecimal, 1-8 characters
+   * (see `canonicalGreKey`). null = keyless GRE, which is not the same as key 0.
+   */
   key: string | null;
   keepaliveIntervalSec: number;
   keepaliveRetries: number;
@@ -683,6 +687,7 @@ export interface GreOpInput {
   tunnelNetwork: string;
   mtu: number;
   ttl: number;
+  /** Canonical GRE key (lowercase hex, 1-8 characters) or null for keyless GRE. */
   key: string | null;
   /** UDP port for GRE-over-FOU encapsulation; null/absent = raw GRE. */
   fouPort: number | null;
@@ -914,6 +919,10 @@ export interface TunnelTestResult {
   pingOk: boolean;
   mtuDetected: number | null;
   error: string | null;
+  /** Canonical GRE key the kernel reported on the interface, when readable. */
+  key?: string | null;
+  /** Whether the kernel's key matches the requested one; null = not readable. */
+  keyVerified?: boolean | null;
 }
 
 // ---------------------------------------------------------------------------

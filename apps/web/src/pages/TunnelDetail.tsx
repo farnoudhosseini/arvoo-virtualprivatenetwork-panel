@@ -160,7 +160,20 @@ export function TunnelDetailPage() {
             <KeyValue label="Local tunnel IP" value={tunnel.localTunnelIp} mono />
             <KeyValue label="Destination endpoint" value={tunnel.destEndpoint} mono />
             <KeyValue label="Remote tunnel IP" value={tunnel.remoteTunnelIp} mono />
-            <KeyValue label="GRE key" value={tunnel.key ?? "none (unkeyed)"} mono />
+            <KeyValue
+              label="GRE key"
+              value={
+                tunnel.key ? (
+                  <>
+                    0x{tunnel.key}
+                    <span className="ml-1 text-2xs text-faint">(decimal {parseInt(tunnel.key, 16)})</span>
+                  </>
+                ) : (
+                  "none (unkeyed)"
+                )
+              }
+              mono
+            />
             <KeyValue label="MTU" value={`${tunnel.mtu}${tunnel.mtuOverride != null ? ` (override, engine: ${tunnel.mtuOverride})` : " (computed)"}`} />
             <KeyValue label="TTL" value={tunnel.ttl} />
             <KeyValue label="Created" value={formatDateTime(tunnel.createdAt)} />
