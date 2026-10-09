@@ -3,10 +3,10 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { toast } from "sonner";
 import {
-  CheckCircle2, Copy, LayoutGrid, List, MoreHorizontal, Plus, RefreshCw, Search, Server, ShieldCheck, Ban, X,
+  CheckCircle2, Copy, LayoutGrid, List, MoreHorizontal, Plus, RefreshCw, Search, Server, ShieldCheck, Ban, X, Trash2, ArrowUpRight,
 } from "lucide-react";
 import { api } from "../lib/api";
-import type { NodeRecord } from "@arvoo/shared";
+import type { NodeDependencies, NodeRecord } from "@arvoo/shared";
 import {
   Badge, Button, Card, EmptyState, Field, IconButton, Input, PageHeader, Select, Textarea, UnifiedStatus, cx,
 } from "../components/ui/primitives";
@@ -34,6 +34,12 @@ export function NodesPage() {
   const [view, setView] = useState<View>("table");
   const [revoke, setRevoke] = useState<NodeRecord | null>(null);
   const [busy, setBusy] = useState(false);
+  // Deletion is previewed against the real dependencies before anything happens.
+  const [remove, setRemove] = useState<{ node: NodeRecord; deps: NodeDependencies | null } | null>(null);
+  const [forceDelete, setForceDelete] = useState(false);
+  const [busyRemove, setBusyRemove] = useState(false);
+  const [decommissionTarget, setDecommissionTarget] = useState<NodeRecord | null>(null);
+  const [busyDecommission, setBusyDecommission] = useState(false);
 
   const nodes = data?.nodes ?? [];
   const rows = useMemo(
@@ -83,6 +89,58 @@ export function NodesPage() {
   const copy = (text: string) => {
     void navigator.clipboard.writeText(text);
     toast.success("Address copied");
+  };
+
+  const openRemove = async (node: NodeRecord) => {
+    setForceDelete(false);
+    setRemove({ node, deps: null });
+    try {
+      const res = await api.get<{ dependencies: NodeDependencies }>(`/nodes/${node.id}/dependencies`);
+      setRemove({ node, deps: res.dependencies });
+    } catch (err) {
+      toast.error((err as Error).message);
+      setRemove(null);
+    }
+  };
+
+  const doDecommission = async () => {
+    if (!decommissionTarget) return;
+    setBusyDecommission(true);
+    try {
+      const res = await api.post<{ decommission: { decommissionState: string; detail: string } }>(
+        `/nodes/${decommissionTarget.id}/decommission`,
+      );
+      const state = res.decommission.decommissionState;
+      if (state === "complete") toast.success(`${decommissionTarget.name} decommissioned - nothing was left on the host`);
+      else if (state === "requested") toast.success(`${decommissionTarget.name}: credential revoked, host cleanup queued`);
+      else toast.warning(`${decommissionTarget.name}: host cleanup is still pending`);
+      invalidate();
+    } catch (err) {
+      toast.error((err as Error).message);
+    } finally {
+      setBusyDecommission(false);
+      setDecommissionTarget(null);
+    }
+  };
+
+  const doRemove = async () => {
+    if (!remove) return;
+    setBusyRemove(true);
+    try {
+      const res = await api.delete<{ deleted: { forced: boolean; pendingCleanup: string | null } }>(
+        `/nodes/${remove.node.id}${forceDelete ? "?force=true" : ""}`,
+      );
+      toast.success(res.deleted.pendingCleanup ? `${remove.node.name} deleted - pending host cleanup recorded` : `${remove.node.name} deleted`);
+      invalidate();
+      setRemove(null);
+      setForceDelete(false);
+    } catch (err) {
+      // The API lists exactly what blocks the deletion; keep the dialog open so
+      // the operator can read it and act on the named resources.
+      toast.error((err as Error).message, { duration: 8000 });
+    } finally {
+      setBusyRemove(false);
+    }
   };
 
   return (
@@ -186,7 +244,17 @@ export function NodesPage() {
               }}
             />
           }
-          rowActions={(n) => <NodeActions node={n} onOpen={() => navigate(`/nodes/${n.id}`)} onApprove={() => approve(n)} onRevoke={() => setRevoke(n)} onCopy={() => copy(n.address ?? n.name)} />}
+          rowActions={(n) => (
+            <NodeActions
+              node={n}
+              onOpen={() => navigate(`/nodes/${n.id}`)}
+              onApprove={() => approve(n)}
+              onRevoke={() => setRevoke(n)}
+              onCopy={() => copy(n.address ?? n.name)}
+              onDecommission={() => setDecommissionTarget(n)}
+              onDelete={() => openRemove(n)}
+            />
+          )}
           empty={
             <EmptyState
               icon={<Server size={18} />}
@@ -263,6 +331,55 @@ export function NodesPage() {
         loading={busy}
         onConfirm={doRevoke}
       />
+
+      <ConfirmDialog
+        open={!!decommissionTarget}
+        onOpenChange={() => setDecommissionTarget(null)}
+        title={`Decommission “${decommissionTarget?.name ?? ""}”?`}
+        message="The agent credential is revoked - no new work and no heartbeats - and the node is asked to remove exactly the interfaces and inbounds this panel created there. Nothing else on the host is touched. The result is recorded from the node's own report."
+        confirmLabel="Decommission"
+        loading={busyDecommission}
+        onConfirm={doDecommission}
+      />
+
+      {/* Deletion previews the real dependencies and never silently force-deletes. */}
+      <ConfirmDialog
+        open={!!remove}
+        onOpenChange={(open) => {
+          if (!open) {
+            setRemove(null);
+            setForceDelete(false);
+          }
+        }}
+        title={`Delete node “${remove?.node.name ?? ""}”?`}
+        message={
+          <span className="space-y-2">
+            <span className="block">
+              {remove?.deps ? remove.deps.summary : "Checking what depends on this node…"}
+            </span>
+            {remove?.deps && remove.deps.blocking.tunnels.length + remove.deps.blocking.inbounds.length > 0 && (
+              <span className="block">
+                Delete or move those resources first; deleting this record while they exist is refused, with or without force.
+              </span>
+            )}
+            {remove?.deps && remove.deps.inFlightOperations.length > 0 && (
+              <span className="block">
+                {remove.deps.inFlightOperations.length} operation(s) are in flight; deleting cancels them with a reason in their history.
+              </span>
+            )}
+            {remove?.node.decommissionState === "partial" && (
+              <label className="flex items-start gap-2 text-2xs text-warning">
+                <input type="checkbox" className="mt-0.5" checked={forceDelete} onChange={(e) => setForceDelete(e.target.checked)} />
+                <span>Force delete: the host never confirmed cleanup. The pending cleanup is written to the audit log instead of being forgotten.</span>
+              </label>
+            )}
+          </span>
+        }
+        confirmLabel={forceDelete ? "Force delete" : "Delete node"}
+        danger
+        loading={busyRemove}
+        onConfirm={doRemove}
+      />
     </div>
   );
 }
@@ -334,13 +451,15 @@ function NodesToolbar({
 }
 
 function NodeActions({
-  node, onOpen, onApprove, onRevoke, onCopy,
+  node, onOpen, onApprove, onRevoke, onCopy, onDecommission, onDelete,
 }: {
   node: NodeRecord;
   onOpen: () => void;
   onApprove: () => void;
   onRevoke: () => void;
   onCopy: () => void;
+  onDecommission: () => void;
+  onDelete: () => void;
 }) {
   return (
     <DropdownMenu>
@@ -367,11 +486,18 @@ function NodeActions({
         {node.enrollmentState === "approved" && (
           <>
             <DropdownSeparator />
+            <DropdownItem onSelect={onDecommission}>
+              <ArrowUpRight size={13} /> Decommission (revoke + clean up)
+            </DropdownItem>
             <DropdownItem danger onSelect={onRevoke}>
               <Ban size={13} /> Revoke enrollment
             </DropdownItem>
           </>
         )}
+        <DropdownSeparator />
+        <DropdownItem danger onSelect={onDelete}>
+          <Trash2 size={13} /> Delete node…
+        </DropdownItem>
       </DropdownContent>
     </DropdownMenu>
   );

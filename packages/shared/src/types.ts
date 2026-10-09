@@ -57,6 +57,92 @@ export interface NodeRecord {
   isSelf: boolean;
   createdAt: ISODate;
   updatedAt: ISODate;
+  /** Cleanup of Arvoo-owned resources on the host: none | requested | partial | complete. */
+  decommissionState: NodeDecommissionState;
+  decommissionedAt: ISODate | null;
+  /** What is still pending on the host, when it could not be cleaned up. */
+  decommissionDetail: string | null;
+  /** When the current agent credential was issued (enrollment or rotation). */
+  tokenIssuedAt: ISODate | null;
+  tokenRotatedAt: ISODate | null;
+  tokenRevokedAt: ISODate | null;
+  /**
+   * Whether the *active* credential can be revealed. It can when the panel holds
+   * an encrypted copy (issued since migration 0006). A node enrolled before that
+   * keeps only a hash: it is not revealable and the API says so instead of
+   * inventing a value.
+   */
+  tokenRevealable: boolean;
+}
+
+/**
+ * Cleanup state of Arvoo-owned resources on a node's host, tracked separately
+ * from enrollment: a revoked node can still have resources pending removal, and
+ * an offline host must never be reported as cleaned up.
+ */
+export type NodeDecommissionState = "none" | "requested" | "partial" | "complete";
+
+/** What an authorized administrator sees about a node's credential - never the secret itself. */
+interface NodeTokenStatusBase {
+  nodeId: UUID;
+  nodeName: string;
+  /** active = the agent can authenticate; revoked = it cannot; none = never issued. */
+  status: "none" | "active" | "revoked";
+  issuedAt: ISODate | null;
+  rotatedAt: ISODate | null;
+  revokedAt: ISODate | null;
+  /** True when the active credential can be revealed through the panel. */
+  revealable: boolean;
+  /** Last heartbeat is the best available evidence that the credential works. */
+  lastHeartbeatAt: ISODate | null;
+  /** Why it cannot be revealed, when it cannot (legacy hash-only enrollment). */
+  reason: string | null;
+}
+
+export interface NodeTokenStatus extends NodeTokenStatusBase {}
+
+/** Reveal/rotate response: the plaintext credential, returned only to an authorized request. */
+export interface NodeTokenSecret extends NodeTokenStatusBase {
+  /** The active agent credential. Revealed on purpose; never logged and never in a list response. */
+  secret: string;
+  /** Exact command that installs the credential on the node, for rotation. */
+  applyCommand: string;
+}
+
+/** Everything that stops a node from being deleted, and everything a real cleanup touches. */
+export interface NodeDependencies {
+  nodeId: UUID;
+  nodeName: string;
+  nodeStatus: NodeStatus;
+  enrollmentState: AgentEnrollmentState;
+  decommissionState: NodeDecommissionState;
+  decommissionDetail: string | null;
+  /** Blocking dependencies: a node with these cannot be deleted at all. */
+  blocking: {
+    tunnels: Array<{ id: string; name: string; otherNodeName: string }>;
+    inbounds: Array<{ id: string; name: string; status: string }>;
+  };
+  /** Resources Arvoo owns on the host and would remove during decommissioning. */
+  managed: {
+    /** GRE interfaces this node terminates (one per tunnel side, by tunnel name). */
+    interfaces: string[];
+    /** OpenVPN inbounds with their systemd instance and config directory. */
+    inbounds: string[];
+    /** Routes the panel installed on this node. */
+    routes: number;
+    /** Load-balancer memberships. */
+    lbMembers: number;
+    /** Certificates issued for this node's inbounds or clients placed here. */
+    certificates: number;
+    /** Client sessions that would be closed. */
+    activeSessions: number;
+  };
+  /** Operations that are queued or running right now. */
+  inFlightOperations: Array<{ id: string; type: string; status: string }>;
+  /** True when every blocking dependency is gone. */
+  deletable: boolean;
+  /** Human-readable summary of what deletion would do, for the confirmation dialog. */
+  summary: string;
 }
 
 export interface NodeInterfaceInfo {
@@ -472,7 +558,24 @@ export type OperationType =
   | "TestTunnel"
   | "RunBenchmark"
   | "SyncConfiguration"
-  | "ConfigureFirewall";
+  | "ConfigureFirewall"
+  /**
+   * Remove every Arvoo-owned resource this control plane created on a node:
+   * exactly the interfaces/inbounds/routes named in the payload, so an
+   * unrelated service or interface on the host is never touched.
+   */
+  | "CleanupNode";
+
+/**
+ * Payload for CleanupNode. Every entry is a resource the control plane owns and
+ * can name; an empty payload is a no-op, not a licence to clean "everything".
+ */
+export interface CleanupNodeOpInput {
+  interfaceNames: string[];
+  inboundNames: string[];
+  /** FOU ports registered for those interfaces, removed when no interface uses them. */
+  fouPorts?: number[];
+}
 
 export type OperationStatus =
   | "queued"
@@ -524,6 +627,11 @@ export type AuditAction =
   | "node.delete"
   | "node.approve"
   | "node.revoke"
+  | "node.token.reveal"
+  | "node.token.rotate"
+  | "node.token.revoke"
+  | "node.decommission"
+  | "node.cleanup"
   | "inbound.create"
   | "inbound.update"
   | "inbound.delete"
@@ -702,6 +810,28 @@ export interface BenchmarkOpInput {
   pingCount?: number;
   /** Try iperf3 to the remote tunnel IP for throughput (server side required). */
   iperfSeconds?: number | null;
+}
+
+/**
+ * Payload the panel queues for TestTunnel.
+ *
+ * The expected configuration travels with the probe so the node compares it
+ * against the kernel (`ip -d link show`, `ip -4 addr show`, `ip route get`) and
+ * against a real ICMP probe - instead of reporting the values it was told.
+ * Field-by-field checking is what separates "the interface exists" from "the
+ * tunnel actually carries traffic".
+ */
+export interface TestTunnelOpInput {
+  interfaceName: string;
+  localEndpoint?: string;
+  remoteEndpoint?: string;
+  localTunnelIp?: string;
+  remoteTunnelIp: string;
+  tunnelNetwork?: string;
+  mtu: number;
+  ttl?: number;
+  /** Canonical GRE key, or null for a keyless tunnel; omitted = not carried. */
+  key?: string | null;
 }
 
 export interface IPsecOpInput {
@@ -917,12 +1047,27 @@ export interface TunnelTestResult {
   lossPct: number | null;
   interfacePresent: boolean;
   pingOk: boolean;
+  /** MTU the kernel reports; null when the interface does not exist. */
   mtuDetected: number | null;
   error: string | null;
   /** Canonical GRE key the kernel reported on the interface, when readable. */
   key?: string | null;
   /** Whether the kernel's key matches the requested one; null = not readable. */
   keyVerified?: boolean | null;
+  /** ICMP replies actually received (null when the probe did not report a summary). */
+  samples?: number | null;
+  /** Administrative UP flag; null when the interface does not exist. */
+  ifUp?: boolean | null;
+  /** LOWER_UP carrier; false means the GRE peer is unreachable. */
+  carrierUp?: boolean | null;
+  /** Each check is null when the payload did not carry the expected value. */
+  endpointVerified?: boolean | null;
+  addressVerified?: boolean | null;
+  mtuVerified?: boolean | null;
+  ttlVerified?: boolean | null;
+  routeOk?: boolean | null;
+  /** Names of the individual checks that failed; empty on a healthy tunnel. */
+  failedChecks?: string[];
 }
 
 // ---------------------------------------------------------------------------

@@ -350,13 +350,83 @@ export function registerRoutes(app: FastifyInstance): void {
     return { node: await nodesService.getNode(id) };
   });
 
+  app.get("/api/v1/nodes/:id/dependencies", async (request) => {
+    requireAuth(request);
+    const { id } = request.params as { id: string };
+    return { dependencies: await nodesService.nodeDependencies(id) };
+  });
+
   app.delete("/api/v1/nodes/:id", async (request) => {
     const a = actor(request, "operator");
+    await requireManagement(request, "deleting a node");
     const { id } = request.params as { id: string };
+    const { force } = parse(z.object({ force: z.coerce.boolean().optional() }), request.query ?? {});
     const node = await nodesService.getNode(id);
-    await nodesService.deleteNode(id);
-    audit({ actorId: a.id, actorName: a.name, action: "node.delete", entityType: "node", entityId: id, entityName: node.name, summary: `Deleted node ${node.name}` });
-    return { ok: true };
+    const result = await nodesService.deleteNode(id, a, { force: force === true });
+    audit({
+      actorId: a.id,
+      actorName: a.name,
+      action: "node.delete",
+      entityType: "node",
+      entityId: id,
+      entityName: node.name,
+      summary:
+        `Deleted node ${node.name}` +
+        (result.forced ? " (forced)" : "") +
+        (result.cancelledOperations > 0 ? `; cancelled ${result.cancelledOperations} in-flight operation(s)` : "") +
+        (result.pendingCleanup ? `; PENDING HOST CLEANUP: ${result.pendingCleanup}` : "; host cleanup complete"),
+    });
+    return { ok: true, deleted: result };
+  });
+
+  // ---- Node credential lifecycle ------------------------------------------
+  app.get("/api/v1/nodes/:id/token", async (request) => {
+    requireAuth(request);
+    const { id } = request.params as { id: string };
+    return { token: await nodesService.nodeTokenStatus(id) };
+  });
+
+  // Revealing a credential is a privileged, audited action: the management gate
+  // applies when it is enabled, and the audit entry never contains the value.
+  app.post("/api/v1/nodes/:id/token/reveal", async (request) => {
+    const a = actor(request, "admin");
+    await requireManagement(request, "revealing a node credential");
+    const { id } = request.params as { id: string };
+    const token = await nodesService.revealNodeToken(id);
+    audit({
+      actorId: a.id,
+      actorName: a.name,
+      action: "node.token.reveal",
+      entityType: "node",
+      entityId: id,
+      entityName: token.nodeName,
+      summary: `Revealed the active agent credential for node ${token.nodeName}`,
+      ip: request.ip,
+    });
+    return { token };
+  });
+
+  app.post("/api/v1/nodes/:id/token/rotate", async (request) => {
+    const a = actor(request, "admin");
+    await requireManagement(request, "rotating a node credential");
+    const { id } = request.params as { id: string };
+    // The new credential is returned in the same response, so the operator can
+    // install it on the node immediately; the previous one is already invalid.
+    return { token: await nodesService.rotateNodeToken(id, a) };
+  });
+
+  app.post("/api/v1/nodes/:id/token/revoke", async (request) => {
+    const a = actor(request, "admin");
+    await requireManagement(request, "revoking a node credential");
+    const { id } = request.params as { id: string };
+    return { token: await nodesService.revokeNodeToken(id, a) };
+  });
+
+  app.post("/api/v1/nodes/:id/decommission", async (request) => {
+    const a = actor(request, "operator");
+    await requireManagement(request, "decommissioning a node");
+    const { id } = request.params as { id: string };
+    return { decommission: await nodesService.decommissionNode(id, a) };
   });
 
   app.post("/api/v1/nodes/:id/enrollment-token", async (request) => {
@@ -405,13 +475,15 @@ export function registerRoutes(app: FastifyInstance): void {
     if (tokenRow.used_at) throw unauthorized("Enrollment token already used");
     if (new Date(tokenRow.expires_at).getTime() < Date.now()) throw unauthorized("Enrollment token expired");
 
-    const secret = `arvnode_${sha256(`${tokenRow.node_id}:${Date.now()}:${Math.random()}`).slice(0, 48)}`;
+    // One minting path for enrollment and rotation: cryptographically random
+    // secret, hash for authentication, encrypted copy so the active credential
+    // can be revealed later by an authorized administrator.
+    const secret = await nodesService.issueNodeCredential(tokenRow.node_id);
     await run(
-      `UPDATE nodes SET enrollment_state = 'enrolled', status = 'pending', hostname = ?, agent_version = ?, agent_platform = ?, node_secret_hash = ?, updated_at = ? WHERE id = ?`,
+      `UPDATE nodes SET enrollment_state = 'enrolled', status = 'pending', hostname = ?, agent_version = ?, agent_platform = ?, updated_at = ? WHERE id = ?`,
       input.hostname,
       input.agentVersion,
       input.platform,
-      sha256(secret),
       nowIso(),
       tokenRow.node_id,
     );

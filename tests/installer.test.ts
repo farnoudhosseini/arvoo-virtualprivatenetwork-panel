@@ -20,11 +20,11 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Client } from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { createTestDatabase, type TestDatabase } from "../apps/api/test/helpers/testdb.js";
+import { createTestDatabase, type TestDatabase, findFreePort } from "../apps/api/test/helpers/testdb.js";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const INSTALLER = path.join(repoRoot, "install.sh");
-const ISOLATED_PORT = 54332;
+let isolatedPort = 0;
 
 const tempDirs: string[] = [];
 let work = "";
@@ -121,6 +121,7 @@ function writeDriver(): string {
 let driverOutput = "";
 
 beforeAll(async () => {
+  isolatedPort = await findFreePort();
   work = mkdtempSync(path.join(tmpdir(), "arvoo-installer-"));
   tempDirs.push(work);
   const driver = writeDriver();
@@ -131,7 +132,7 @@ beforeAll(async () => {
   }
   driverOutput = result.stdout;
 
-  db = await createTestDatabase({ port: ISOLATED_PORT, databaseName: "arvoo_installer" });
+  db = await createTestDatabase({ port: isolatedPort, databaseName: "arvoo_installer" });
 }, 180_000);
 
 afterAll(async () => {
@@ -171,7 +172,7 @@ describe("PostgreSQL role provisioning is idempotent (BUG 3)", () => {
       await admin.query(sql);
 
       // The password that install.sh wrote into DATABASE_URL really works.
-      const app = new Client({ connectionString: `postgresql://arvoo_user:first-password@127.0.0.1:${ISOLATED_PORT}/arvoo_installer` });
+      const app = new Client({ connectionString: `postgresql://arvoo_user:first-password@127.0.0.1:${isolatedPort}/arvoo_installer` });
       await app.connect();
       const who = await app.query<{ current_user: string }>("SELECT current_user");
       expect(who.rows[0]!.current_user).toBe("arvoo_user");
@@ -179,11 +180,11 @@ describe("PostgreSQL role provisioning is idempotent (BUG 3)", () => {
 
       // A later run with a new password rotates it instead of failing.
       await admin.query(sql.replace(/first-password/g, "rotated-password"));
-      const rotated = new Client({ connectionString: `postgresql://arvoo_user:rotated-password@127.0.0.1:${ISOLATED_PORT}/arvoo_installer` });
+      const rotated = new Client({ connectionString: `postgresql://arvoo_user:rotated-password@127.0.0.1:${isolatedPort}/arvoo_installer` });
       await rotated.connect();
       await rotated.end();
 
-      const old = new Client({ connectionString: `postgresql://arvoo_user:first-password@127.0.0.1:${ISOLATED_PORT}/arvoo_installer` });
+      const old = new Client({ connectionString: `postgresql://arvoo_user:first-password@127.0.0.1:${isolatedPort}/arvoo_installer` });
       await expect(old.connect()).rejects.toBeTruthy();
     } finally {
       await admin.end();
@@ -197,7 +198,7 @@ describe("PostgreSQL role provisioning is idempotent (BUG 3)", () => {
     await admin.connect();
     try {
       await admin.query(sql);
-      const app = new Client({ connectionString: `postgresql://arvoo_user:pa'ss word@127.0.0.1:${ISOLATED_PORT}/arvoo_installer` });
+      const app = new Client({ connectionString: `postgresql://arvoo_user:pa'ss word@127.0.0.1:${isolatedPort}/arvoo_installer` });
       await app.connect();
       await app.end();
     } finally {

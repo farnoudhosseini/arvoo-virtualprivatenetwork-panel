@@ -66,6 +66,17 @@ export async function buildApp(opts: BuildAppOptions = {}): Promise<FastifyInsta
       reply.code(429).send({ error: { message: "Too many requests. Slow down and try again." } });
       return;
     }
+    // Fastify's own transport errors carry a 4xx statusCode: an empty body with
+    // `Content-Type: application/json`, an unsupported media type, a body over
+    // the limit. Those are the client's mistake, not a control-plane fault, so
+    // they are answered as such instead of being reported as an unhandled 500
+    // (which an operator would read as a broken API and which buried real
+    // failures in the log). 5xx Fastify errors still go through the block below.
+    const code = (error as { statusCode?: number }).statusCode;
+    if (typeof code === "number" && code >= 400 && code < 500) {
+      reply.code(code).send({ error: { message: error.message, details: null } });
+      return;
+    }
     console.error("[api] unhandled error:", error);
     reply.code(500).send({
       error: {

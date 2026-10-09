@@ -49,6 +49,37 @@ async function columnExists(table: string, column: string): Promise<boolean> {
   return rows[0]?.exists === true;
 }
 
+/**
+ * The referential action of a foreign key: 'n' is ON DELETE SET NULL, 'a' is NO
+ * ACTION. Deployment history must survive the node it was deployed to, so this is
+ * asserted on the constraint itself, not inferred from a successful delete.
+ */
+async function fkDeleteAction(table: string, column: string): Promise<string | null> {
+  const rows = await q<{ action: string | null }>(
+    `SELECT (
+       SELECT c.confdeltype::text FROM pg_constraint c
+         JOIN pg_class t ON t.oid = c.conrelid
+         JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY (c.conkey)
+        WHERE t.relname = $1 AND c.contype = 'f' AND a.attname = $2
+        LIMIT 1
+     ) AS action`,
+    table,
+    column,
+  );
+  return rows[0]?.action ?? null;
+}
+
+async function columnIsNullable(table: string, column: string): Promise<boolean> {
+  const rows = await q<{ nullable: boolean }>(
+    `SELECT is_nullable = 'YES' AS nullable
+       FROM information_schema.columns
+      WHERE table_schema = 'public' AND table_name = $1 AND column_name = $2`,
+    table,
+    column,
+  );
+  return rows[0]?.nullable === true;
+}
+
 beforeAll(async () => {
   // This file deliberately reverts the shipped migrations, so it must never
   // touch another suite's (or a developer's) cluster: it boots its own on a port
@@ -79,11 +110,14 @@ describe("shipped migrations", () => {
     const greKeys = rows.find((r) => r.name === "0005_gre_key_canonical.sql")!;
     expect(greKeys.appliedAt).toBeNull();
     expect(greKeys.reversible).toBe(true);
+    const lifecycle = rows.find((r) => r.name === "0006_node_lifecycle.sql")!;
+    expect(lifecycle.appliedAt).toBeNull();
+    expect(lifecycle.reversible).toBe(true);
   });
 
   it("applies, reverts and re-applies the initial schema (reproducible)", async () => {
     const applied = await migrate(SHIPPED_MIGRATIONS);
-    expect(applied).toBe(5);
+    expect(applied).toBe(6);
     expect(await tableExists("nodes")).toBe(true);
     expect(await tableExists("clients")).toBe(true);
     expect(await tableExists("tunnel_secrets")).toBe(true);
@@ -105,11 +139,32 @@ describe("shipped migrations", () => {
     expect(await columnExists("nodes", "ssh_port")).toBe(true);
     // §GRE key: the column only accepts the canonical hexadecimal form.
     expect(await constraintExists("tunnels", "tunnels_key_canonical")).toBe(true);
+    // §Node lifecycle: recoverable credential, tracked decommission state, and a
+    // deployment history that outlives the node it was deployed to.
+    expect(await columnExists("nodes", "node_secret_encrypted")).toBe(true);
+    expect(await columnExists("nodes", "decommission_state")).toBe(true);
+    expect(await constraintExists("nodes", "nodes_decommission_state_check")).toBe(true);
+    expect(await columnExists("nodes", "token_rotated_at")).toBe(true);
+    expect(await fkDeleteAction("inbound_deployments", "node_id")).toBe("n");
+    expect(await columnIsNullable("inbound_deployments", "node_id")).toBe(true);
+    // A bogus cleanup state cannot be stored.
+    await expect(
+      q(`INSERT INTO nodes (id, name, role, region_class, tags, status, enrollment_state, is_self, decommission_state, created_at, updated_at)
+         VALUES ('mig-bad-decom', 'mig-bad-decom', 'vpn', 'iran', '[]', 'pending', 'not_enrolled', 0, 'half-done', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')`),
+    ).rejects.toThrow(/nodes_decommission_state_check/);
 
     // Re-running applies nothing: the runner is idempotent.
     expect(await migrate(SHIPPED_MIGRATIONS)).toBe(0);
 
     // Downgrade of the newest migration removes only its own objects.
+    expect(await migrateDown(SHIPPED_MIGRATIONS, { steps: 1 })).toEqual(["0006_node_lifecycle.sql"]);
+    expect(await columnExists("nodes", "node_secret_encrypted")).toBe(false);
+    expect(await columnExists("nodes", "decommission_state")).toBe(false);
+    expect(await fkDeleteAction("inbound_deployments", "node_id")).toBe("a");
+    expect(await columnIsNullable("inbound_deployments", "node_id")).toBe(false);
+    expect(await tableExists("nodes")).toBe(true);
+
+    // Downgrade of the GRE-key migration removes only its own objects.
     expect(await migrateDown(SHIPPED_MIGRATIONS, { steps: 1 })).toEqual(["0005_gre_key_canonical.sql"]);
     expect(await constraintExists("tunnels", "tunnels_key_canonical")).toBe(false);
     expect(await tableExists("tunnels")).toBe(true);
@@ -146,12 +201,69 @@ describe("shipped migrations", () => {
     expect((await migrationStatus(SHIPPED_MIGRATIONS))[0]!.appliedAt).toBeNull();
 
     // ...and the schema can be rebuilt exactly the same way.
-    expect(await migrate(SHIPPED_MIGRATIONS)).toBe(5);
+    expect(await migrate(SHIPPED_MIGRATIONS)).toBe(6);
     expect(await tableExists("nodes")).toBe(true);
     expect(await tableExists("routing_policies")).toBe(true);
     expect(await tableExists("lb_members")).toBe(true);
     expect(await columnExists("clients", "ovpn_username")).toBe(true);
     expect(await constraintExists("tunnels", "tunnels_key_canonical")).toBe(true);
+    expect(await fkDeleteAction("inbound_deployments", "node_id")).toBe("n");
+  });
+
+  it("keeps deployment history when the node it was deployed to is deleted", async () => {
+    const { run, nowIso } = await import("../src/db/index.js");
+    // Self-sufficient: apply anything the previous test left pending.
+    await migrate(SHIPPED_MIGRATIONS);
+    const at = nowIso();
+    // Two nodes: the inbound lives on `keeper`, the deployment referenced the
+    // node that is about to be deleted.
+    for (const [id, name] of [
+      ["mig-hist-node", "mig-hist-node"],
+      ["mig-hist-keeper", "mig-hist-keeper"],
+    ] as const) {
+      await run(
+        `INSERT INTO nodes (id, name, role, region_class, tags, status, enrollment_state, is_self, created_at, updated_at)
+         VALUES (?,?, 'vpn', 'iran', '[]', 'online', 'approved', 0, ?, ?)`,
+        id,
+        name,
+        at,
+        at,
+      );
+    }
+    await run(
+      `INSERT INTO inbounds (id, name, node_id, status, structured_config, current_version, created_at, updated_at)
+       VALUES ('mig-hist-inbound', 'mig-hist-inbound', 'mig-hist-keeper', 'active', '{}', 1, ?, ?)`,
+      at,
+      at,
+    );
+    await run(
+      `INSERT INTO operations (id, type, node_id, status, progress, created_at)
+       VALUES ('mig-hist-op', 'CreateGRE', 'mig-hist-node', 'success', 100, ?)`,
+      at,
+    );
+    await run(
+      `INSERT INTO inbound_deployments (id, inbound_id, node_id, version, operation_id, status, created_at)
+       VALUES ('mig-hist-deploy', 'mig-hist-inbound', 'mig-hist-node', 1, 'mig-hist-op', 'success', ?)`,
+      at,
+    );
+
+    // The node owns no inbounds or tunnels, exactly like a node whose resources
+    // were released before it was removed.
+    await run(`DELETE FROM nodes WHERE id = 'mig-hist-node'`);
+
+    const deployments = await q<{ node_id: string | null; inbound_id: string; status: string }>(
+      `SELECT node_id, inbound_id, status FROM inbound_deployments WHERE id = 'mig-hist-deploy'`,
+    );
+    expect(deployments).toHaveLength(1);
+    expect(deployments[0]?.node_id).toBeNull();
+    expect(deployments[0]?.status).toBe("success");
+    const operations = await q<{ node_id: string | null }>(`SELECT node_id FROM operations WHERE id = 'mig-hist-op'`);
+    expect(operations[0]?.node_id).toBeNull();
+
+    await q(`DELETE FROM inbound_deployments WHERE id = 'mig-hist-deploy'`);
+    await q(`DELETE FROM operations WHERE id = 'mig-hist-op'`);
+    await q(`DELETE FROM inbounds WHERE id = 'mig-hist-inbound'`);
+    await q(`DELETE FROM nodes WHERE id = 'mig-hist-keeper'`);
   });
 
   it("canonicalises legacy decimal GRE keys without changing the key value", async () => {

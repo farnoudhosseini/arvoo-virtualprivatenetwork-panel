@@ -179,3 +179,250 @@ export function greKeyFromLinkShow(stdout: string): string | null {
   if (!match) return null;
   return canonicalGreKey(match[1]);
 }
+
+// ---------------------------------------------------------------------------
+// Reading the data plane back from the kernel (TestTunnel)
+// ---------------------------------------------------------------------------
+
+/**
+ * What the kernel actually has for one GRE interface, read from
+ * `ip -d link show <ifname>`. `-d` is required: the key, ttl and endpoints only
+ * appear in the detailed dump, and a probe that cannot see them would have to
+ * echo the requested configuration back instead of verifying it.
+ *
+ * `present: false` (empty/failed dump) is a different failure from "exists but
+ * configured differently", and the caller must keep them apart.
+ */
+export interface GreLinkState {
+  present: boolean;
+  /** Administrative UP flag from `<...UP...>`; null when the interface is absent. */
+  up: boolean | null;
+  /** LOWER_UP: false means the GRE peer is not reachable over the public path. */
+  carrier: boolean | null;
+  localEndpoint: string | null;
+  remoteEndpoint: string | null;
+  ttl: number | null;
+  mtu: number | null;
+  /** Canonical key the kernel reports; null when the link carries no key field. */
+  key: string | null;
+}
+
+const ABSENT_LINK: GreLinkState = {
+  present: false,
+  up: null,
+  carrier: null,
+  localEndpoint: null,
+  remoteEndpoint: null,
+  ttl: null,
+  mtu: null,
+  key: null,
+};
+
+/** Parse the output of `ip -d link show <ifname>`. Never throws on garbage. */
+export function greLinkStateFromLinkShow(stdout: string): GreLinkState {
+  // Header: "6: gre1@NONE: <POINTOPOINT,NOARP,UP,LOWER_UP> mtu 1452 ..."
+  if (!/^\d+:\s+\S+[@:]/m.test(stdout)) return ABSENT_LINK;
+
+  const flags = (stdout.match(/<([^>]*)>/)?.[1] ?? "").split(/[\s,]+/).filter(Boolean);
+  const ttlMatch = stdout.match(/(?:^|\s)ttl\s+(\d+)/);
+  const mtuMatch = stdout.match(/(?:^|\s)mtu\s+(\d+)/);
+  return {
+    present: true,
+    up: flags.includes("UP"),
+    carrier: flags.includes("LOWER_UP"),
+    localEndpoint: stdout.match(/(?:^|\s)local\s+(\d{1,3}(?:\.\d{1,3}){3})/)?.[1] ?? null,
+    remoteEndpoint: stdout.match(/(?:^|\s)remote\s+(\d{1,3}(?:\.\d{1,3}){3})/)?.[1] ?? null,
+    ttl: ttlMatch ? Number(ttlMatch[1]) : null,
+    mtu: mtuMatch ? Number(mtuMatch[1]) : null,
+    key: greKeyFromLinkShow(stdout),
+  };
+}
+
+/** Addresses assigned to an interface as CIDR, from `ip -4 addr show dev <if>`. */
+export function tunnelAddressesFromAddrShow(stdout: string): string[] {
+  const out: string[] = [];
+  for (const match of stdout.matchAll(/^\s*inet\s+(\d{1,3}(?:\.\d{1,3}){3}\/\d{1,2})/gm)) out.push(match[1]!);
+  return out;
+}
+
+/** The interface `ip route get <ip>` selects, or null when the lookup printed none. */
+export function routeDeviceFromRouteGet(stdout: string): string | null {
+  return stdout.match(/(?:^|\s)dev\s+(\S+)/)?.[1] ?? null;
+}
+
+/**
+ * The configuration the control plane expects on this node. Optional fields
+ * that a payload does not carry stay undefined: the corresponding check is then
+ * reported as `null` (not verifiable) instead of being silently passed.
+ */
+export interface ExpectedGreConfig {
+  interfaceName: string;
+  localEndpoint?: string | null;
+  remoteEndpoint?: string | null;
+  localTunnelIp?: string | null;
+  remoteTunnelIp?: string | null;
+  tunnelNetwork?: string | null;
+  mtu?: number | null;
+  ttl?: number | null;
+  /** Canonical key, null for a keyless tunnel; undefined when not carried. */
+  key?: string | null;
+}
+
+/** What the probe actually observed on the node. */
+export interface ObservedGreState {
+  link: GreLinkState;
+  /** CIDRs currently assigned (`ip -4 addr show dev <if>`); [] when absent. */
+  addresses: string[];
+  /** Interface `ip route get <remoteTunnelIp>` selects; null when it failed. */
+  routeDev: string | null;
+  /** Real ICMP result across the tunnel; null when it was not attempted. */
+  pingOk: boolean | null;
+}
+
+export interface GreVerification {
+  /** `ok` is true only when every verifiable check passed. */
+  ok: boolean;
+  interfacePresent: boolean;
+  ifUp: boolean | null;
+  carrierUp: boolean | null;
+  endpointVerified: boolean | null;
+  ttlVerified: boolean | null;
+  mtuVerified: boolean | null;
+  keyVerified: boolean | null;
+  addressVerified: boolean | null;
+  routeOk: boolean | null;
+  pingOk: boolean | null;
+  /** MTU the kernel reports (never the one that was requested). */
+  mtuDetected: number | null;
+  /** Canonical key the kernel reports, when readable. */
+  observedKey: string | null;
+  /** Names of the checks that failed (null checks were not verifiable). */
+  failedChecks: string[];
+  /** One sanitized sentence per failure - IPs, MTU, key; never a secret. */
+  failures: string[];
+}
+
+/**
+ * Compare the expected configuration against the kernel state and the ICMP
+ * result. Pure: no I/O, so the "interface exists but the data plane is broken"
+ * cases are unit-testable without root and without a real node.
+ */
+export function verifyGreTunnel(expected: ExpectedGreConfig, observed: ObservedGreState): GreVerification {
+  const { link } = observed;
+  const name = expected.interfaceName;
+  const failedChecks: string[] = [];
+  const failures: string[] = [];
+
+  const interfacePresent = link.present;
+  const ifUp = link.present ? link.up : null;
+  const carrierUp = link.present ? link.carrier : null;
+
+  if (!interfacePresent) {
+    failedChecks.push("interface");
+    failures.push(`interface ${name} does not exist on this node`);
+  } else if (ifUp === false) {
+    failedChecks.push("ifUp");
+    failures.push(`interface ${name} is administratively down`);
+  }
+
+  let endpointVerified: boolean | null = null;
+  if (link.present && expected.localEndpoint && expected.remoteEndpoint) {
+    endpointVerified = link.localEndpoint === expected.localEndpoint && link.remoteEndpoint === expected.remoteEndpoint;
+    if (!endpointVerified) {
+      failedChecks.push("endpoint");
+      failures.push(
+        `kernel has local/remote ${link.localEndpoint ?? "unset"}/${link.remoteEndpoint ?? "unset"}, expected ${expected.localEndpoint}/${expected.remoteEndpoint}`,
+      );
+    }
+  }
+
+  let ttlVerified: boolean | null = null;
+  if (link.present && expected.ttl != null) {
+    ttlVerified = link.ttl === expected.ttl;
+    if (!ttlVerified) {
+      failedChecks.push("ttl");
+      failures.push(`kernel reports ttl ${link.ttl ?? "unset"}, expected ${expected.ttl}`);
+    }
+  }
+
+  let mtuVerified: boolean | null = null;
+  if (link.present && expected.mtu != null) {
+    mtuVerified = link.mtu === expected.mtu;
+    if (!mtuVerified) {
+      failedChecks.push("mtu");
+      failures.push(`kernel reports mtu ${link.mtu ?? "unset"}, expected ${expected.mtu}`);
+    }
+  }
+
+  let keyVerified: boolean | null = null;
+  if (link.present && expected.key !== undefined) {
+    if (expected.key === null) {
+      keyVerified = link.key === null;
+      if (!keyVerified) {
+        failedChecks.push("key");
+        failures.push(`this tunnel is configured keyless but the kernel installed GRE key 0x${link.key}`);
+      }
+    } else {
+      const want = canonicalGreKey(expected.key);
+      keyVerified = want !== null && link.key === want;
+      if (!keyVerified) {
+        failedChecks.push("key");
+        failures.push(`kernel reports GRE key ${link.key === null ? "none" : `0x${link.key}`}, expected 0x${want ?? expected.key}`);
+      }
+    }
+  }
+
+  let addressVerified: boolean | null = null;
+  if (link.present && expected.localTunnelIp) {
+    const prefix = expected.tunnelNetwork?.match(/\/(\d{1,2})$/)?.[1] ?? null;
+    const want = prefix === null ? expected.localTunnelIp : `${expected.localTunnelIp}/${prefix}`;
+    addressVerified = observed.addresses.includes(want);
+    if (!addressVerified) {
+      failedChecks.push("address");
+      failures.push(
+        `address ${want} is not assigned to ${name} (assigned: ${observed.addresses.length > 0 ? observed.addresses.join(", ") : "none"})`,
+      );
+    }
+  }
+
+  let routeOk: boolean | null = null;
+  if (link.present && expected.remoteTunnelIp) {
+    routeOk = observed.routeDev === expected.interfaceName;
+    if (!routeOk) {
+      failedChecks.push("route");
+      failures.push(
+        `the kernel routes ${expected.remoteTunnelIp} via ${observed.routeDev ?? "no route"} instead of ${name}`,
+      );
+    }
+  }
+
+  const pingOk = observed.pingOk;
+  if (pingOk === false && interfacePresent) {
+    failedChecks.push("ping");
+    failures.push(
+      `ICMP to ${expected.remoteTunnelIp ?? "the remote tunnel address"} across ${name} produced no replies` +
+        (link.carrier === false ? " and the interface has no carrier" : ""),
+    );
+  }
+
+  const verified = [endpointVerified, ttlVerified, mtuVerified, keyVerified, addressVerified, routeOk];
+  const ok = interfacePresent && ifUp !== false && pingOk !== false && verified.every((check) => check !== false);
+
+  return {
+    ok,
+    interfacePresent,
+    ifUp,
+    carrierUp,
+    endpointVerified,
+    ttlVerified,
+    mtuVerified,
+    keyVerified,
+    addressVerified,
+    routeOk,
+    pingOk,
+    mtuDetected: link.mtu,
+    observedKey: link.key,
+    failedChecks,
+    failures,
+  };
+}

@@ -11,15 +11,26 @@ import { createConnection } from "node:net";
 import path from "node:path";
 import type {
   BenchmarkOpInput,
+  CleanupNodeOpInput,
   FirewallOpInput,
   FirewallRule,
   GreOpInput,
   IPsecOpInput,
   NodeCapabilities,
   OpenVPNOpInput,
+  TestTunnelOpInput,
   TunnelTestResult,
 } from "@arvoo/shared";
-import { GRE_KEY_RULE, canonicalGreKey, greKeyCliValue, greKeyFromLinkShow } from "@arvoo/shared";
+import {
+  GRE_KEY_RULE,
+  canonicalGreKey,
+  greKeyCliValue,
+  greKeyFromLinkShow,
+  greLinkStateFromLinkShow,
+  routeDeviceFromRouteGet,
+  tunnelAddressesFromAddrShow,
+  verifyGreTunnel,
+} from "@arvoo/shared";
 import { applyFirewallPlan, ufwAvailable } from "./ufw.js";
 import { exec } from "./linux.js";
 
@@ -265,38 +276,77 @@ export async function deleteGre(input: { interfaceName: string }): Promise<OpRes
   return { success: true, output: { removed: true } };
 }
 
-export async function testGre(input: {
-  interfaceName: string;
-  remoteTunnelIp: string;
-  mtu: number;
-}): Promise<OpResult> {
+/**
+ * Verify the tunnel that is actually configured on this node.
+ *
+ * Every value is read back from the kernel - the interface state from
+ * `ip -d link show`, the assigned addresses from `ip -4 addr show dev`, the
+ * egress decision from `ip route get <remote>` - and the data plane from a real
+ * ICMP probe. The panel's expected configuration is compared field by field, so
+ * an interface that exists but has the wrong key, address, MTU or no route fails
+ * the test instead of being reported as a healthy tunnel. Each check is reported
+ * individually (`failedChecks`) and the operation itself is failed when the
+ * tunnel does not verify, so the dashboard cannot show green for a dead tunnel.
+ */
+export async function testGre(input: TestTunnelOpInput): Promise<OpResult> {
   if (process.platform !== "linux") return requiresLinux();
-  const link = await exec("ip", ["link", "show", input.interfaceName]);
-  const interfacePresent = link.code === 0;
-  if (!interfacePresent) {
+
+  const link = await exec("ip", ["-d", "link", "show", input.interfaceName]).catch(() => null);
+  const state = greLinkStateFromLinkShow(link?.code === 0 ? link.stdout : "");
+
+  let addresses: string[] = [];
+  let routeDev: string | null = null;
+  if (state.present) {
+    const addr = await exec("ip", ["-4", "addr", "show", "dev", input.interfaceName]).catch(() => null);
+    addresses = addr?.code === 0 ? tunnelAddressesFromAddrShow(addr.stdout) : [];
+    const route = await exec("ip", ["route", "get", input.remoteTunnelIp], 8000).catch(() => null);
+    routeDev = route?.code === 0 ? routeDeviceFromRouteGet(route.stdout) : null;
+  }
+
+  // One real probe across the tunnel interface. "No reply" is a measurement of a
+  // broken data plane, not an error of the check itself.
+  const ping = state.present
+    ? await exec("ping", ["-c", "5", "-W", "2", "-I", input.interfaceName, input.remoteTunnelIp], 20000).catch(() => null)
+    : null;
+  const lossMatch = ping?.stdout.match(/(\d+(?:\.\d+)?)% packet loss/);
+  const lossPct = lossMatch ? Number(lossMatch[1]) : null;
+  const receivedMatch = ping?.stdout.match(/(\d+) received/);
+  const received = receivedMatch ? Number(receivedMatch[1]) : null;
+  const rttMatch = ping?.stdout.match(/= [\d.]+\/([\d.]+)\//);
+  const latencyMs = rttMatch ? Number(rttMatch[1]) : null;
+  const pingOk = state.present && ping?.code === 0;
+
+  const check = verifyGreTunnel(input, { link: state, addresses, routeDev, pingOk: state.present ? pingOk : false });
+
+  const output: TunnelTestResult = {
+    ok: check.ok,
+    latencyMs,
+    lossPct,
+    samples: received,
+    interfacePresent: check.interfacePresent,
+    pingOk,
+    mtuDetected: check.mtuDetected,
+    key: check.observedKey,
+    keyVerified: check.keyVerified,
+    ifUp: check.ifUp,
+    carrierUp: check.carrierUp,
+    endpointVerified: check.endpointVerified,
+    addressVerified: check.addressVerified,
+    mtuVerified: check.mtuVerified,
+    ttlVerified: check.ttlVerified,
+    routeOk: check.routeOk,
+    failedChecks: check.failedChecks,
+    error: check.failures.length > 0 ? check.failures.join("; ") : null,
+  };
+
+  if (!check.ok) {
     return {
-      success: true,
-      output: { ok: false, interfacePresent: false, pingOk: false, latencyMs: null, lossPct: null, mtuDetected: null, error: "Interface missing" } satisfies TunnelTestResult,
+      success: false,
+      output,
+      error: `Tunnel ${input.interfaceName} failed verification: ${check.failures.join("; ") || "unknown reason"}`,
     };
   }
-  const ping = await exec("ping", ["-c", "5", "-W", "2", "-I", input.interfaceName, input.remoteTunnelIp], 20000);
-  const lossMatch = ping.stdout.match(/(\d+(?:\.\d+)?)% packet loss/);
-  const lossPct = lossMatch ? Number(lossMatch[1]) : null;
-  const rttMatch = ping.stdout.match(/= [\d.]+\/([\d.]+)\//);
-  const latencyMs = rttMatch ? Number(rttMatch[1]) : null;
-  const pingOk = ping.code === 0;
-  return {
-    success: true,
-    output: {
-      ok: pingOk,
-      interfacePresent,
-      pingOk,
-      latencyMs,
-      lossPct,
-      mtuDetected: input.mtu,
-      error: pingOk ? null : "ping failed",
-    } satisfies TunnelTestResult,
-  };
+  return { success: true, output };
 }
 
 // ---------------------------------------------------------------------------
@@ -446,7 +496,10 @@ export interface BenchmarkResult {
   jitterMs: number | null;
   lossPct: number | null;
   throughputMbps: number | null;
-  samples: number;
+  /** ICMP replies actually received - never the number that was requested. */
+  samples: number | null;
+  /** Set when the probe measured partial connectivity (packet loss). */
+  warning?: string | null;
 }
 
 /** Parse the received throughput from `iperf3 -J` output. Null when absent or invalid. */
@@ -468,13 +521,17 @@ export async function runBenchmark(input: BenchmarkOpInput): Promise<OpResult> {
   const count = input.pingCount ?? 20;
   const ping = await exec("ping", ["-c", String(count), "-i", "0.2", "-W", "2", "-I", input.interfaceName, input.remoteTunnelIp], count * 1000 + 10000);
   const lossMatch = ping.stdout.match(/(\d+(?:\.\d+)?)% packet loss/);
+  const receivedMatch = ping.stdout.match(/(\d+) received/);
   const rtt = ping.stdout.match(/= ([\d.]+)\/([\d.]+)\/([\d.]+)(?:\/([\d.]+))?/);
   const result: BenchmarkResult = {
     latencyMs: rtt ? Number(rtt[2]) : null,
     jitterMs: rtt && rtt[4] ? Number(rtt[4]) : null,
     lossPct: lossMatch ? Number(lossMatch[1]) : null,
     throughputMbps: null,
-    samples: count,
+    // Replies, not probes: a benchmark that measured nothing must not report a
+    // sample count as if it had.
+    samples: receivedMatch ? Number(receivedMatch[1]) : null,
+    warning: null,
   };
 
   if (input.iperfSeconds) {
@@ -488,8 +545,23 @@ export async function runBenchmark(input: BenchmarkOpInput): Promise<OpResult> {
     result.throughputMbps = parseIperfMbps(iperf?.stdout ?? "");
   }
 
-  if (result.lossPct == null && result.latencyMs == null) {
-    return { success: false, error: "Benchmark produced no measurements: the tunnel did not answer ICMP." };
+  // Success requires a tunnel that answered with measurements. 100% loss, a ping
+  // that never printed a summary (timeout) or nothing parsable at all is a
+  // failed benchmark - it may never be reported as a successful empty one.
+  const totalLoss = (result.lossPct != null && result.lossPct >= 100) || result.samples === 0;
+  if (totalLoss || (result.lossPct == null && result.latencyMs == null)) {
+    return {
+      success: false,
+      output: result,
+      error: totalLoss
+        ? `Benchmark produced no measurements: 100% packet loss to ${input.remoteTunnelIp} across ${input.interfaceName}.`
+        : "Benchmark produced no measurements: the tunnel did not answer ICMP.",
+    };
+  }
+
+  // Partial connectivity is reported explicitly instead of being averaged away.
+  if (result.lossPct != null && result.lossPct > 0) {
+    result.warning = `Partial connectivity: ${result.lossPct}% packet loss to ${input.remoteTunnelIp} across ${input.interfaceName}.`;
   }
   return { success: true, output: result };
 }
@@ -744,14 +816,80 @@ WantedBy=multi-user.target
   return { success: true, output: { verified: true, port: input.port } };
 }
 
-export async function deleteOpenVPNInbound(input: { inboundName: string; clientNetwork: string }): Promise<OpResult> {
+export async function deleteOpenVPNInbound(input: { inboundName: string; clientNetwork?: string | null }): Promise<OpResult> {
   if (process.platform !== "linux") return requiresLinux();
-  await exec("systemctl", ["stop", `arvoo-openvpn@${input.inboundName}`], 20000);
+  const stop = await exec("systemctl", ["stop", `arvoo-openvpn@${input.inboundName}`], 20000);
   await exec("systemctl", ["disable", `arvoo-openvpn@${input.inboundName}`]).catch(() => undefined);
   await rm(`/etc/arvoo/openvpn/${input.inboundName}`, { recursive: true, force: true });
-  const ifname = await detectDefaultInterface();
-  await exec("iptables", ["-t", "nat", "-D", "POSTROUTING", "-s", input.clientNetwork, "-o", ifname, "-j", "MASQUERADE"]).catch(() => undefined);
+  // The MASQUERADE rule only exists for an inbound with a client network; the
+  // cleanup path has no network to hand and must not build a bogus iptables rule.
+  if (input.clientNetwork) {
+    const ifname = await detectDefaultInterface();
+    await exec("iptables", ["-t", "nat", "-D", "POSTROUTING", "-s", input.clientNetwork, "-o", ifname, "-j", "MASQUERADE"]).catch(() => undefined);
+  }
+  // "Unit not loaded / not found" means the instance is already gone, which is
+  // the state this call wants; anything else is a real failure and is reported.
+  if (stop.code !== 0 && !/not found|not loaded|No such file/i.test(stop.stderr)) {
+    return { success: false, error: stop.stderr.trim() || `systemctl stop exited ${stop.code}` };
+  }
   return { success: true, output: { removed: true } };
+}
+
+/**
+ * Remove exactly the Arvoo-owned resources this control plane names - one GRE
+ * interface and one IPsec/FOU registration per tunnel it terminates, one
+ * systemd instance and config directory per inbound it hosts.
+ *
+ * It is deliberately not a "clean the host" operation: an empty payload removes
+ * nothing, an unrelated interface or service is never touched, a resource that is
+ * already gone counts as success (the call must be safe to repeat), and anything
+ * that fails is reported by name so the panel can keep the cleanup state at
+ * `partial` instead of claiming the host is clean.
+ */
+export async function cleanupNode(input: CleanupNodeOpInput): Promise<OpResult> {
+  if (process.platform !== "linux") return requiresLinux();
+  const removed: string[] = [];
+  const absent: string[] = [];
+  const failed: Array<{ name: string; error: string }> = [];
+
+  for (const interfaceName of input.interfaceNames) {
+    try {
+      const del = await exec("ip", ["link", "del", interfaceName]);
+      if (del.code === 0) removed.push(`interface:${interfaceName}`);
+      else if (/cannot find device|does not exist/i.test(del.stderr)) absent.push(`interface:${interfaceName}`);
+      else failed.push({ name: `interface:${interfaceName}`, error: del.stderr.trim() || `ip link del exited ${del.code}` });
+    } catch (err) {
+      failed.push({ name: `interface:${interfaceName}`, error: (err as Error).message });
+    }
+    // The tunnel's IPsec connection and its saved definition are ours as well.
+    await removeIPsec({ interfaceName }).catch(() => undefined);
+    await rm(`/etc/arvoo/gre/${interfaceName}.json`, { force: true }).catch(() => undefined);
+  }
+
+  for (const inboundName of input.inboundNames) {
+    try {
+      const res = await deleteOpenVPNInbound({ inboundName });
+      if (res.success) removed.push(`inbound:${inboundName}`);
+      else failed.push({ name: `inbound:${inboundName}`, error: res.error ?? "removal failed" });
+    } catch (err) {
+      failed.push({ name: `inbound:${inboundName}`, error: (err as Error).message });
+    }
+  }
+
+  for (const port of input.fouPorts ?? []) {
+    const del = await exec("ip", ["fou", "del", "port", String(port)]).catch(() => null);
+    if (del?.code === 0) removed.push(`fou-port:${port}`);
+    else if (del) absent.push(`fou-port:${port}`);
+  }
+
+  if (failed.length > 0) {
+    return {
+      success: false,
+      output: { removed, absent, failed },
+      error: `Cleanup incomplete: ${failed.map((f) => `${f.name} (${f.error})`).join("; ")}`,
+    };
+  }
+  return { success: true, output: { removed, absent, failed } };
 }
 
 /**

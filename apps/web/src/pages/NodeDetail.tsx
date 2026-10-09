@@ -5,11 +5,12 @@ import { ResponsiveContainer, LineChart, Line, XAxis, YAxis, Tooltip as ReToolti
 import { toast } from "sonner";
 import {
   Ban, Cpu, HardDrive, MemoryStick, Network, Activity, Boxes, Server, ShieldCheck, Globe, Gauge, RefreshCw, Plug,
+  KeyRound, ShieldAlert, Trash2, Eye, TriangleAlert, ArrowUpRight,
 } from "lucide-react";
 import { api } from "../lib/api";
-import type { NodeRecord, NodeTelemetry } from "@arvoo/shared";
+import type { NodeDependencies, NodeRecord, NodeTelemetry, NodeTokenSecret, NodeTokenStatus } from "@arvoo/shared";
 import {
-  Badge, BackLink, Button, Card, CardHeader, EmptyState, ErrorState, KeyValue, LoadingState, Meter,
+  Badge, BackLink, Button, Card, CardHeader, CopyField, EmptyState, ErrorState, KeyValue, LoadingState, Meter,
   PageHeader, UnifiedStatus, cx,
 } from "../components/ui/primitives";
 import { StatCard, DataTable, CodeBlock } from "../components/ui/data";
@@ -33,11 +34,28 @@ export function NodeDetailPage() {
   const queryClient = useQueryClient();
   const [confirm, setConfirm] = useState<"approve" | "revoke" | null>(null);
   const [busy, setBusy] = useState(false);
+  const [lifecycle, setLifecycle] = useState<"rotate" | "revoke-token" | "decommission" | "delete" | null>(null);
+  const [forceDelete, setForceDelete] = useState(false);
+  const [revealed, setRevealed] = useState<NodeTokenSecret | null>(null);
+  const [working, setWorking] = useState<"reveal" | "rotate" | "revoke-token" | "decommission" | "delete" | null>(null);
 
   const { data, isLoading, isError, error, refetch, isFetching } = useQuery({
     queryKey: ["node", id],
     queryFn: () => api.get<NodeDetailResponse>(`/nodes/${id}`),
     refetchInterval: 10_000,
+    enabled: !!id,
+  });
+
+  // Credential metadata and dependencies are separate endpoints: the secret is
+  // never part of the node record, so it is only fetched when it is asked for.
+  const tokenQuery = useQuery({
+    queryKey: ["node-token", id],
+    queryFn: () => api.get<{ token: NodeTokenStatus }>(`/nodes/${id}/token`),
+    enabled: !!id,
+  });
+  const depsQuery = useQuery({
+    queryKey: ["node-deps", id],
+    queryFn: () => api.get<{ dependencies: NodeDependencies }>(`/nodes/${id}/dependencies`),
     enabled: !!id,
   });
 
@@ -59,6 +77,100 @@ export function NodeDetailPage() {
     } finally {
       setBusy(false);
       setConfirm(null);
+    }
+  };
+
+  const token = tokenQuery.data?.token ?? null;
+  const deps = depsQuery.data?.dependencies ?? null;
+
+  const refreshLifecycle = () => {
+    void queryClient.invalidateQueries({ queryKey: ["node", id] });
+    void queryClient.invalidateQueries({ queryKey: ["node-token", id] });
+    void queryClient.invalidateQueries({ queryKey: ["node-deps", id] });
+    void queryClient.invalidateQueries({ queryKey: ["nodes"] });
+  };
+
+  const revealToken = async () => {
+    setWorking("reveal");
+    try {
+      const res = await api.post<{ token: NodeTokenSecret }>(`/nodes/${id}/token/reveal`);
+      setRevealed(res.token);
+      toast.success("Active credential revealed");
+    } catch (err) {
+      toast.error((err as Error).message);
+    } finally {
+      setWorking(null);
+    }
+  };
+
+  // A rotation returns the new credential in the same response, so it is shown
+  // at once - the previous one stops authenticating immediately.
+  const rotateToken = async () => {
+    setWorking("rotate");
+    try {
+      const res = await api.post<{ token: NodeTokenSecret }>(`/nodes/${id}/token/rotate`);
+      setRevealed(res.token);
+      toast.success("Credential rotated - install the new value on the node now");
+      refreshLifecycle();
+    } catch (err) {
+      toast.error((err as Error).message);
+    } finally {
+      setWorking(null);
+      setLifecycle(null);
+    }
+  };
+
+  const revokeToken = async () => {
+    setWorking("revoke-token");
+    try {
+      await api.post(`/nodes/${id}/token/revoke`);
+      setRevealed(null);
+      toast.success("Credential revoked - the agent can no longer authenticate");
+      refreshLifecycle();
+    } catch (err) {
+      toast.error((err as Error).message);
+    } finally {
+      setWorking(null);
+      setLifecycle(null);
+    }
+  };
+
+  const decommission = async () => {
+    setWorking("decommission");
+    try {
+      const res = await api.post<{ decommission: { decommissionState: string; detail: string; operationId: string | null } }>(
+        `/nodes/${id}/decommission`,
+      );
+      const state = res.decommission.decommissionState;
+      if (state === "complete") toast.success("Decommissioned: the credential is revoked and nothing was left on the host");
+      else if (state === "requested") toast.success("Credential revoked. Host cleanup is queued - wait for it before deleting");
+      else toast.warning(`Credential revoked. Host cleanup is still pending: ${res.decommission.detail}`);
+      refreshLifecycle();
+    } catch (err) {
+      toast.error((err as Error).message);
+    } finally {
+      setWorking(null);
+      setLifecycle(null);
+    }
+  };
+
+  const deleteNode = async () => {
+    setWorking("delete");
+    try {
+      const res = await api.delete<{ deleted: { forced: boolean; pendingCleanup: string | null; cancelledOperations: number } }>(
+        `/nodes/${id}${forceDelete ? "?force=true" : ""}`,
+      );
+      toast.success(
+        res.deleted.pendingCleanup ? "Node deleted - pending host cleanup was recorded in the audit log" : "Node deleted",
+      );
+      void queryClient.invalidateQueries({ queryKey: ["nodes"] });
+      navigate("/nodes");
+    } catch (err) {
+      toast.error((err as Error).message);
+    } finally {
+      setWorking(null);
+      setLifecycle(null);
+      setForceDelete(false);
     }
   };
 
@@ -129,6 +241,39 @@ export function NodeDetailPage() {
           <span className="text-muted">
             The agent enrolled successfully and is waiting for approval. Verify the reported platform
             (<span className="mono text-text/90">{node.agentPlatform ?? "unknown"}</span>) before approving.
+          </span>
+        </div>
+      )}
+
+      {/* Decommissioning is a stored state, not a guess: the host may still hold
+          resources the panel created, and that is what this banner says. */}
+      {node.decommissionState === "requested" && (
+        <div className="mb-4 flex items-start gap-2.5 rounded-default border border-info/25 bg-info-soft px-3.5 py-3 text-xs leading-relaxed">
+          <RefreshCw size={15} className="mt-0.5 shrink-0 text-info" />
+          <span className="text-muted">
+            <span className="font-medium text-info">Decommissioning in progress.</span> The credential is revoked and host cleanup is queued. The
+            node's own report decides when the cleanup is complete.
+          </span>
+        </div>
+      )}
+      {(node.decommissionState === "partial" || (node.decommissionState === "complete" && node.decommissionDetail)) && (
+        <div
+          className={cx(
+            "mb-4 flex items-start gap-2.5 rounded-default border px-3.5 py-3 text-xs leading-relaxed",
+            node.decommissionState === "partial" ? "border-warning/25 bg-warning-soft" : "border-line/70 bg-surface-2",
+          )}
+        >
+          {node.decommissionState === "partial" ? (
+            <TriangleAlert size={15} className="mt-0.5 shrink-0 text-warning" />
+          ) : (
+            <ShieldCheck size={15} className="mt-0.5 shrink-0 text-success" />
+          )}
+          <span className="text-muted">
+            <span className={cx("font-medium", node.decommissionState === "partial" ? "text-warning" : "text-success")}>
+              {node.decommissionState === "partial" ? "Host cleanup is still pending." : "Host cleanup complete."}
+            </span>{" "}
+            {node.decommissionDetail}
+            {node.decommissionState === "partial" && " Re-run decommission when the node is reachable, or delete the record with force (the pending cleanup stays in the audit log)."}
           </span>
         </div>
       )}
@@ -377,6 +522,176 @@ export function NodeDetailPage() {
             ),
           },
           {
+            value: "access",
+            label: "Access & lifecycle",
+            content: (
+              <div className="grid gap-4 lg:grid-cols-2">
+                <Card>
+                  <CardHeader
+                    title="Agent credential"
+                    desc="What this node authenticates with - shown on purpose, never logged"
+                    icon={<KeyRound size={14} />}
+                  />
+                  <div className="px-4 py-2">
+                    <KeyValue
+                      label="Status"
+                      value={
+                        token ? (
+                          <Badge tone={token.status === "active" ? "success" : token.status === "revoked" ? "danger" : "neutral"}>
+                            {token.status === "active" ? "active" : token.status === "revoked" ? "revoked" : "no credential yet"}
+                          </Badge>
+                        ) : (
+                          "—"
+                        )
+                      }
+                    />
+                    <KeyValue label="Issued" value={token ? timeAgo(token.issuedAt) : "—"} />
+                    <KeyValue label="Rotated" value={token?.rotatedAt ? timeAgo(token.rotatedAt) : "never"} />
+                    <KeyValue label="Revoked" value={token?.revokedAt ? timeAgo(token.revokedAt) : "—"} />
+                    <KeyValue label="Last heartbeat" value={timeAgo(node.lastHeartbeatAt)} />
+                  </div>
+                  {token && !token.revealable && token.reason && (
+                    <p className="mx-4 mb-3 rounded-default border border-warning/25 bg-warning-soft px-3 py-2 text-2xs leading-relaxed text-warning">
+                      {token.reason}
+                    </p>
+                  )}
+                  <div className="flex flex-wrap gap-2 border-t border-line/70 px-4 py-3">
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      disabled={!token?.revealable}
+                      loading={working === "reveal"}
+                      onClick={revealToken}
+                    >
+                      <Eye size={13} /> Reveal active credential
+                    </Button>
+                    <Button size="sm" variant="secondary" onClick={() => setLifecycle("rotate")} disabled={node.enrollmentState === "not_enrolled"}>
+                      <RefreshCw size={13} /> Rotate
+                    </Button>
+                    <Button size="sm" variant="danger" onClick={() => setLifecycle("revoke-token")} disabled={!token || token.status !== "active"}>
+                      <Ban size={13} /> Revoke credential
+                    </Button>
+                  </div>
+                  {revealed && (
+                    <div className="border-t border-line/70 p-4">
+                      <div className="mb-2 flex items-center gap-1.5 text-2xs text-warning">
+                        <ShieldAlert size={13} /> The active credential. It is returned by this request only - not in any list, log or export.
+                      </div>
+                      <CopyField label="Active credential" value={revealed.secret} />
+                      <p className="mt-3 text-2xs text-faint">Install it on the node (rewrites the agent identity and restarts the service):</p>
+                      <CodeBlock filename="apply-credential.sh" maxHeight="150px" code={revealed.applyCommand} />
+                    </div>
+                  )}
+                </Card>
+
+                <Card>
+                  <CardHeader
+                    title="Host cleanup & deletion"
+                    desc="Everything Arvoo owns on this machine, and what stops deletion"
+                    icon={<Trash2 size={14} />}
+                  />
+                  <div className="px-4 py-2">
+                    <KeyValue
+                      label="Cleanup state"
+                      value={
+                        <Badge
+                          tone={
+                            node.decommissionState === "complete"
+                              ? "success"
+                              : node.decommissionState === "partial"
+                                ? "warning"
+                                : node.decommissionState === "requested"
+                                  ? "info"
+                                  : "neutral"
+                          }
+                        >
+                          {node.decommissionState}
+                        </Badge>
+                      }
+                    />
+                    <KeyValue
+                      label="Blocking tunnels"
+                      value={
+                        deps && deps.blocking.tunnels.length > 0 ? (
+                          <span className="flex flex-wrap gap-1.5">
+                            {deps.blocking.tunnels.map((t) => (
+                              <Link key={t.id} to={`/tunnels/${t.id}`} className="mono text-2xs text-accent hover:underline">
+                                {t.name} → {t.otherNodeName}
+                              </Link>
+                            ))}
+                          </span>
+                        ) : (
+                          "none"
+                        )
+                      }
+                    />
+                    <KeyValue
+                      label="Blocking inbounds"
+                      value={
+                        deps && deps.blocking.inbounds.length > 0 ? (
+                          <span className="flex flex-wrap gap-1.5">
+                            {deps.blocking.inbounds.map((i) => (
+                              <Link key={i.id} to={`/inbounds/${i.id}`} className="mono text-2xs text-accent hover:underline">
+                                {i.name}
+                              </Link>
+                            ))}
+                          </span>
+                        ) : (
+                          "none"
+                        )
+                      }
+                    />
+                    <KeyValue
+                      label="Arvoo-managed here"
+                      value={
+                        deps
+                          ? `${deps.managed.interfaces.length} interface(s), ${deps.managed.inbounds.length} inbound(s), ${deps.managed.routes} route(s)`
+                          : "—"
+                      }
+                      mono
+                    />
+                    <KeyValue
+                      label="Memberships & sessions"
+                      value={deps ? `${deps.managed.lbMembers} load-balancer member(s), ${deps.managed.activeSessions} live session(s)` : "—"}
+                    />
+                    <KeyValue
+                      label="In-flight operations"
+                      value={
+                        deps && deps.inFlightOperations.length > 0 ? (
+                          <span className="flex flex-wrap gap-1.5">
+                            {deps.inFlightOperations.map((o) => (
+                              <Badge key={o.id} tone="info" mono>
+                                {o.type} · {o.status}
+                              </Badge>
+                            ))}
+                          </span>
+                        ) : (
+                          "none"
+                        )
+                      }
+                    />
+                  </div>
+                  <p className="mx-4 mb-3 rounded-default border border-line/70 bg-surface-2 px-3 py-2 text-2xs leading-relaxed text-muted">
+                    {deps?.summary ?? "Loading dependency summary…"}
+                  </p>
+                  <div className="flex flex-wrap gap-2 border-t border-line/70 px-4 py-3">
+                    <Button size="sm" variant="secondary" onClick={() => setLifecycle("decommission")} loading={working === "decommission"}>
+                      <ArrowUpRight size={13} /> Decommission node
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="danger"
+                      onClick={() => setLifecycle("delete")}
+                      disabled={deps ? !deps.deletable : false}
+                    >
+                      <Trash2 size={13} /> Delete node
+                    </Button>
+                  </div>
+                </Card>
+              </div>
+            ),
+          },
+          {
             value: "operations",
             label: "Operations",
             count: data.operations.length,
@@ -437,6 +752,68 @@ export function NodeDetailPage() {
         danger
         onConfirm={() => act("revoke")}
         loading={busy}
+      />
+
+      <ConfirmDialog
+        open={lifecycle === "rotate"}
+        onOpenChange={() => setLifecycle(null)}
+        title={`Rotate the credential for “${node.name}”?`}
+        message="A new credential is generated and returned immediately; the current one stops authenticating at once, so the running agent must be updated with the new value in the same step. The new value is shown here and can be revealed again later."
+        confirmLabel="Rotate credential"
+        onConfirm={rotateToken}
+        loading={working === "rotate"}
+      />
+      <ConfirmDialog
+        open={lifecycle === "revoke-token"}
+        onOpenChange={() => setLifecycle(null)}
+        title={`Revoke the credential for “${node.name}”?`}
+        message="Heartbeats and operations stop immediately and the agent cannot authenticate again until a new credential is issued. The node record and its history are kept."
+        confirmLabel="Revoke credential"
+        danger
+        onConfirm={revokeToken}
+        loading={working === "revoke-token"}
+      />
+      <ConfirmDialog
+        open={lifecycle === "decommission"}
+        onOpenChange={() => setLifecycle(null)}
+        title={`Decommission “${node.name}”?`}
+        message={
+          deps
+            ? `${deps.summary} The credential is revoked and the node is asked to remove exactly what the panel created there (${deps.managed.interfaces.length} interface(s), ${deps.managed.inbounds.length} inbound(s)).`
+            : "The credential is revoked and host cleanup is queued."
+        }
+        confirmLabel="Decommission"
+        onConfirm={decommission}
+        loading={working === "decommission"}
+      />
+      <ConfirmDialog
+        open={lifecycle === "delete"}
+        onOpenChange={(open) => {
+          if (!open) {
+            setLifecycle(null);
+            setForceDelete(false);
+          }
+        }}
+        title={`Delete “${node.name}”?`}
+        message={
+          <span className="space-y-2">
+            <span className="block">
+              Deleting removes the node, its credential, telemetry, routes and memberships. Operation history is kept. It is refused while tunnels or inbounds
+              still name this node.
+              {node.decommissionState === "partial" && " Host cleanup is still pending for this machine."}
+            </span>
+            {node.decommissionState === "partial" && (
+              <label className="flex items-start gap-2 text-2xs text-warning">
+                <input type="checkbox" className="mt-0.5" checked={forceDelete} onChange={(e) => setForceDelete(e.target.checked)} />
+                <span>Force delete the record anyway. The pending host cleanup is written to the audit log so it is not forgotten.</span>
+              </label>
+            )}
+          </span>
+        }
+        confirmLabel={forceDelete ? "Force delete" : "Delete node"}
+        danger
+        onConfirm={deleteNode}
+        loading={working === "delete"}
       />
     </div>
   );

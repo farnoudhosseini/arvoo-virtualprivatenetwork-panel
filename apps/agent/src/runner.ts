@@ -68,6 +68,9 @@ export async function executeOperation(op: AgentOperationPayload, ctx: OpContext
       case "CollectDiagnostics":
         result = await ops.collectDiagnostics();
         break;
+      case "CleanupNode":
+        result = await ops.cleanupNode(input);
+        break;
       case "SyncConfiguration":
         result = { success: true, output: { note: "Configuration already synchronized declaratively" } };
         break;

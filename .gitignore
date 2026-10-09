@@ -16,3 +16,17 @@ data/*.db-shm
 *.log
 .vite/
 coverage/
+
+# scratch databases and smoke-test state (created by dev/CI runs; never commit)
+.smoke/
+
+# token visibility detail surfaced by the node lifecycle migration (see 0006)
+# and its secret envelope column. Revealing is a privileged session action, not a file.
+revealable.ts
+
+# node lifecycle migration (and its reverse) - versioned SQL that ships on disk
+# to support the new node lifecycle features.
+apps/api/src/migrations/0006_node_lifecycle.sql
+apps/api/src/migrations/0006_node_lifecycle.down.sql
+
+

@@ -48,6 +48,9 @@ Helpers: `isValidGreKey`, `canonicalGreKey`, `canonicalGreKeyFromDecimal`,
 | `apps/agent/src/ops.ts` | `greLinkArgs()` builds the argv; the key goes to `ip` as `0x<hex>` (iproute2 parses `key` with base 0, so a bare hex string with letters is rejected and a digits-only value would be read as decimal). After creation the agent reads the key back from `ip -d link show` and **fails** if the kernel installed a different one |
 | `apps/api/src/migrations/0005_gre_key_canonical.sql` | canonicalises existing rows and adds a `CHECK` constraint |
 | `apps/web/src/pages/Tunnels.tsx`, `TunnelDetail.tsx` | custom hex key option with live validation/normalisation; the detail page shows `0x<key>` and its decimal value |
+| `packages/shared/src/gre.ts` | `greLinkStateFromLinkShow` / `tunnelAddressesFromAddrShow` / `routeDeviceFromRouteGet` / `verifyGreTunnel` - pure inspectors and the field-by-field comparison used by TestTunnel |
+| `apps/agent/src/ops.ts` | `testGre()` verifies the kernel instead of echoing the request; `runBenchmark()` reports received samples and fails on zero measurements |
+| `apps/api/src/services/tunnels.ts` | `testTunnel()` queues the expected configuration so the node can compare it |
 
 ### The migration and existing values
 
@@ -69,9 +72,52 @@ stored, so it can never reach the operation queue again. The `.down.sql` drops t
 constraint; the rewrite itself is intentionally not reversed (a migrated key is
 indistinguishable from one that was always hex, so reversing would have to guess).
 
+## TestTunnel and RunBenchmark: real verification, not a superficial pass
+
+The second reported symptom was a `TestTunnel` that "succeeded" on a tunnel whose
+`RunBenchmark` could not get a single ICMP reply. The old agent code was the reason:
+it looked only at whether the interface **existed**, pinged once, and returned
+`mtuDetected: input.mtu` - the MTU it had just been asked to configure. A tunnel
+with the wrong key, the wrong tunnel address, or no route at all could pass.
+
+`testGre()` now reads the data plane back from the kernel and compares it with the
+configuration the panel queued (`TestTunnelOpInput`):
+
+| Check | Source |
+| --- | --- |
+| interface exists / administratively up / carrier | `ip -d link show` flags |
+| local + remote endpoints, ttl, mtu | `ip -d link show` detail fields |
+| GRE key (canonical, never assumed) | `key ...` in the detailed dump |
+| tunnel address + prefix | `ip -4 addr show dev <if>` |
+| route to the remote tunnel IP | `ip route get <remote>` selects `<if>` |
+| data plane | real `ping -c 5 -I <if>` across the tunnel |
+
+Every check is reported individually (`failedChecks`, `endpointVerified`,
+`mtuVerified`, `keyVerified`, `addressVerified`, `routeOk`, `pingOk`, `ifUp`,
+`carrierUp`) and checks the payload does not carry stay `null` - *not verifiable*,
+never a silent pass. When any verifiable check fails, the **operation is reported
+failed** with the failing checks named, so the dashboard can no longer show a green
+TestTunnel for a tunnel that carries nothing. `mtuDetected` is now the MTU the
+kernel reports.
+
+`runBenchmark()` reports the ICMP replies it actually received (`samples`), fails on
+zero measurements or total loss with an explicit cause, and surfaces partial
+connectivity as a `warning` instead of averaging it away. iperf3 throughput is still
+only added when iperf3 actually produced it.
+
+### Exactly-once claiming
+
+`claimNextOperation()` now claims as a compare-and-set: only the poll whose
+`UPDATE ... WHERE id = ? AND status = 'queued'` actually changes a row gets the
+operation. Two pollers at the same moment (a duplicated agent process, or a retry
+while the previous poll is in flight) used to select the same candidate and both
+execute it - a second `ip link`/systemd run for the same operation. The loser now
+receives `{ operation: null }` and polls again; the row and its `claimed_at` reflect
+the single real claim.
+
 ## Verification performed in this workspace
 
-* `npx vitest run` → **20 files, 324 tests passing**; `npm run typecheck` and
+* `npx vitest run` → **22 files, 367 tests passing**; `npm run typecheck` and
   `npm run build` → exit 0 (web bundle included, so the shared value import resolves).
 * `packages/shared/src/gre.test.ts` covers the full matrix: `1`, `a`, 8-char keys,
   lower/upper/mixed case, `0x`/`0X`, `0`, `ffffffff`, `100000000` → reject,
@@ -81,7 +127,25 @@ indistinguishable from one that was always hex, so reversing would have to guess
   (`... ttl 255 key 0xac80001`) and that a digits-only key is not read as decimal.
 * `apps/api/test/api.test.ts` posts the decimal key through the real HTTP route and
   asserts `400` **and that no tunnel row and no operation were created**; it also
-  asserts both queued `CreateGRE` payloads carry the canonical key.
+  asserts both queued `CreateGRE` payloads carry the canonical key, and that the
+  queued `TestTunnel` payload carries the full expected configuration from storage.
+* `packages/shared/src/tunnel-verify.test.ts` (22 tests) feeds real `iproute2`
+  output to the inspectors and asserts the verdicts: healthy, wrong key, keyless
+  tunnel with a key, MTU/ttl mismatch, missing address, wrong or absent route,
+  administratively down, missing interface, blocked ICMP, and the legacy payload.
+* `apps/agent/test/tunnel-verify.test.ts` (18 tests) drives the real executor with a
+  mocked `exec` seam and asserts the *operation result*: an interface that exists
+  and answers ping but has the wrong key **fails** (this is the "superficial check"
+  regression), and `/benchmark` on a silent tunnel fails with `100% packet loss`
+  instead of returning empty measurements.
+* `apps/api/test/api.test.ts` additionally asserts that a concurrent double poll of
+  `/api/v1/agent/operations` hands the operation out exactly once, and that the
+  queued `TestTunnel` payload carries the expected configuration from storage.
+* The real agent runner was driven with the panel-built payloads (`executeOperation`):
+  the full expectation, the legacy three-field shape and a keyless expectation are all
+  accepted at the privileged boundary (and then fail honestly with "requires a Linux
+  node" on this Windows host), while a legacy decimal key and a malformed endpoint are
+  refused with `Rejected invalid operation payload: ...`.
 * `apps/api/test/migrations.test.ts` seeds pre-0005 decimal rows, re-runs the
   migration and asserts `180879361→ac80001`, `12345678→bc614e`, and that an
   unrepresentable value is cleared. (The test now allocates a free port via
@@ -143,6 +207,13 @@ ping -c 3 -I <ifname> 10.200.0.1    # TR-01 -> TCI-01
 #    then POST /api/v1/tunnels/<id>/test and /benchmark and compare the reported
 #    latency/loss against the pings above.
 ```
+
+The TestTunnel operation must settle as `success` with `ok: true` and
+`failedChecks: []`. If it settles as `failed`, its error names the failing checks
+(`key`, `address`, `route`, `ping`, ...) and the operation output carries the value
+the kernel reported next to the expected one - run the same `ip` commands above to
+see it directly. A benchmark on a tunnel that answers nothing now fails with
+`100% packet loss to <ip> across <ifname>` and stores no measurements.
 
 The agent reports the key it read back (`output.key`, `output.keyVerified`) with the
 CreateGRE result, and fails the operation outright if the kernel installed a

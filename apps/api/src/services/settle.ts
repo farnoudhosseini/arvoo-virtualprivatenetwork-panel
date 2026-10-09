@@ -2,6 +2,7 @@ import { q1 } from "../db/index.js";
 import { completeOperation } from "./operations.js";
 import { onDeploymentOperationSettled, onEgressOperationSettled } from "./inbounds.js";
 import { onGreOperationSettled, recordTunnelTest } from "./tunnels.js";
+import { onCleanupOperationSettled } from "./nodes.js";
 import { recordPathHealth } from "./routing.js";
 import { onFirewallOperationSettled } from "./firewall.js";
 
@@ -31,6 +32,11 @@ export async function settleOperation(
       break;
     case "CreateGRE":
       await onGreOperationSettled(operationId, success, payload.output, payload.error ?? null);
+      break;
+    // The stored decommission state follows the node's own report: "complete"
+    // only when the host confirmed the resources are gone.
+    case "CleanupNode":
+      await onCleanupOperationSettled(operationId, success, payload.output, payload.error ?? null);
       break;
     case "ConfigureFirewall": {
       const result = (payload.output ?? {}) as { rules?: unknown; enabled?: boolean; verified?: boolean };

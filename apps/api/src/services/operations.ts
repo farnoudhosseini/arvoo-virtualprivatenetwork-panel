@@ -59,12 +59,18 @@ export async function claimNextOperation(nodeId: string): Promise<unknown | null
     nodeId,
   );
   if (!next) return null;
-  await run(
+  // Claim as a compare-and-set: only the poll that actually flips the row from
+  // 'queued' to 'running' may execute it. Two pollers (a duplicated agent
+  // process, or a retry while another poll is in flight) select the same
+  // candidate, and exactly one of them gets a changed row - the loser receives
+  // nothing instead of executing the same operation a second time.
+  const claim = await run(
     `UPDATE operations SET status = 'running', progress = 5, claimed_at = ?, started_at = ? WHERE id = ? AND status = 'queued'`,
     nowIso(),
     nowIso(),
     next.id,
   );
+  if (claim.changes === 0) return null;
   await logOperation(next.id, "info", "claim", "Operation claimed by node agent");
   return {
     id: next.id,

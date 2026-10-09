@@ -206,11 +206,25 @@ export function validateOperationInput(type: string, raw: unknown): string | nul
       if (!input) return "input must be an object";
       return checkIfName(input.interfaceName, "interfaceName");
     case "TestTunnel":
+      // The panel queues the exact configuration the kernel must have, so the
+      // probe can compare against it (`verifyGreTunnel`). Those expectation
+      // fields are optional: an older payload still runs the checks it can carry
+      // and reports the others as "not verifiable" rather than passing them.
       if (!input) return "input must be an object";
       return (
         checkIfName(input.interfaceName, "interfaceName") ??
         checkIpv4(input.remoteTunnelIp, "remoteTunnelIp") ??
-        checkInt(input.mtu, "mtu", 576, 1500)
+        checkInt(input.mtu, "mtu", 576, 1500) ??
+        (input.localEndpoint === undefined ? null : checkIpv4(input.localEndpoint, "localEndpoint")) ??
+        (input.remoteEndpoint === undefined ? null : checkIpv4(input.remoteEndpoint, "remoteEndpoint")) ??
+        (input.localTunnelIp === undefined ? null : checkIpv4(input.localTunnelIp, "localTunnelIp")) ??
+        (input.tunnelNetwork === undefined ? null : checkCidr(input.tunnelNetwork, "tunnelNetwork")) ??
+        (input.ttl === undefined ? null : checkInt(input.ttl, "ttl", 1, 255)) ??
+        (input.key === undefined || input.key === null
+          ? null
+          : typeof input.key === "string" && canonicalGreKey(input.key) !== null
+            ? null
+            : `key must be ${GRE_KEY_RULE}`)
       );
     case "CreateOpenVPNInbound":
     case "UpdateOpenVPNInbound": {
@@ -269,6 +283,34 @@ export function validateOperationInput(type: string, raw: unknown): string | nul
         (input.pingCount === undefined || input.pingCount === null ? null : checkInt(input.pingCount, "pingCount", 1, 200)) ??
         (input.iperfSeconds === undefined || input.iperfSeconds === null ? null : checkInt(input.iperfSeconds, "iperfSeconds", 1, 60))
       );
+    case "CleanupNode": {
+      if (!input) return "input must be an object";
+      const interfaceNames = input.interfaceNames;
+      const inboundNames = input.inboundNames;
+      if (!Array.isArray(interfaceNames)) return "interfaceNames must be an array";
+      if (!Array.isArray(inboundNames)) return "inboundNames must be an array";
+      if (interfaceNames.length + inboundNames.length > MAX_CLEANUP_RESOURCES) {
+        return `a cleanup may name at most ${MAX_CLEANUP_RESOURCES} resources`;
+      }
+      for (const name of interfaceNames) {
+        // Only names this control plane could have created: the agent deletes
+        // exactly what it is told, so the name is still checked as a name.
+        const err = checkIfName(name, "interfaceNames[]");
+        if (err) return err;
+      }
+      for (const name of inboundNames) {
+        const err = checkName(name, "inboundNames[]");
+        if (err) return err;
+      }
+      if (input.fouPorts !== undefined && input.fouPorts !== null) {
+        if (!Array.isArray(input.fouPorts) || input.fouPorts.length > 64) return "fouPorts must be an array";
+        for (const port of input.fouPorts) {
+          const err = checkInt(port, "fouPorts[]", 1024, 65535);
+          if (err) return err;
+        }
+      }
+      return null;
+    }
     case "ApplyFirewallPolicy": {
       if (!input) return "input must be an object";
       return (
@@ -301,6 +343,8 @@ export function validateOperationInput(type: string, raw: unknown): string | nul
  */
 const FIREWALL_PROTOS = new Set(["tcp", "udp", "gre", "esp", "icmp"]);
 const MAX_FIREWALL_RULES = 512;
+/** A node cleanup may name this many interfaces + inbounds in total. */
+const MAX_CLEANUP_RESOURCES = 128;
 
 function checkFirewallOperation(input: Rec): string | null {
   if (!isSafeName(input.nodeName, 63)) return "nodeName is not a valid host name";

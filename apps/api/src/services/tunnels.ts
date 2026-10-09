@@ -1,5 +1,5 @@
 import { q, q1, run, uuid, nowIso } from "../db/index.js";
-import type { GreOpInput, IPsecOpInput, TunnelRecord } from "@arvoo/shared";
+import type { GreOpInput, IPsecOpInput, TestTunnelOpInput, TunnelRecord } from "@arvoo/shared";
 import { computeGreMtu, carve30, ipToInt, canonicalGreKey, greKeyFromBytes, GRE_KEY_RULE } from "@arvoo/shared";
 import { badRequest, conflict, notFound, unprocessable } from "../lib/errors.js";
 import { enqueueOperation, logOperation } from "./operations.js";
@@ -367,6 +367,10 @@ export async function recordTunnelTest(tunnelId: string, result: {
 
 export async function testTunnel(id: string, actor: { id: string; name: string }): Promise<{ operationId: string }> {
   const tunnel = await getTunnel(id);
+  // The expected configuration travels with the probe. The node compares it
+  // against the kernel (interface flags, endpoints, ttl, mtu, key, address,
+  // route) and against a real ICMP probe, so "the interface exists" can no
+  // longer be reported as a working tunnel.
   const op = await enqueueOperation({
     type: "TestTunnel",
     nodeId: tunnel.sourceNodeId,
@@ -375,10 +379,15 @@ export async function testTunnel(id: string, actor: { id: string; name: string }
     requestedBy: actor.name,
     input: {
       interfaceName: tunnel.name,
-      remoteTunnelIp: tunnel.remoteTunnelIp,
+      localEndpoint: tunnel.sourceEndpoint,
+      remoteEndpoint: tunnel.destEndpoint,
       localTunnelIp: tunnel.localTunnelIp,
+      remoteTunnelIp: tunnel.remoteTunnelIp,
+      tunnelNetwork: tunnel.tunnelNetwork,
       mtu: tunnel.mtu,
-    },
+      ttl: tunnel.ttl,
+      key: tunnel.key,
+    } satisfies TestTunnelOpInput,
   });
   return { operationId: op.id };
 }

@@ -140,9 +140,29 @@ describe("node enrollment flow", () => {
     const approve = await api("POST", `/api/v1/nodes/${nodeId}/approve`);
     expect(approve.statusCode).toBe(200);
 
-    // fetch valid secret? We cannot recover it (only hash stored) - simulate a
-    // second node enrollment to obtain a full working secret for flow tests.
-    expect(true).toBe(true);
+    // The credential issued at enrollment is no longer only a hash: an
+    // authorized reveal returns the exact value the agent authenticates with,
+    // so this flow can send a real heartbeat instead of skipping the check.
+    const reveal = await api("POST", `/api/v1/nodes/${nodeId}/token/reveal`);
+    expect(reveal.statusCode).toBe(200);
+    const secret = reveal.json().token.secret as string;
+    expect(secret).toMatch(/^arvnode_/);
+
+    const heartbeat = await app.inject({
+      method: "POST",
+      url: "/api/v1/agent/heartbeat",
+      payload: { telemetry },
+      headers: { authorization: `Bearer arvoo-node ${nodeId}:${secret}` },
+    });
+    expect(heartbeat.statusCode).toBe(200);
+
+    const wrong = await app.inject({
+      method: "POST",
+      url: "/api/v1/agent/heartbeat",
+      payload: { telemetry },
+      headers: { authorization: `Bearer arvoo-node ${nodeId}:arvnode_not-the-secret` },
+    });
+    expect(wrong.statusCode).toBe(401);
   });
 });
 
@@ -546,6 +566,56 @@ describe("routing intelligence", () => {
   });
 });
 
+describe("operation claiming (exactly once)", () => {
+  it("hands one operation to exactly one poller, even under a concurrent poll", async () => {
+    const { enqueueOperation, claimNextOperation } = await import("../src/services/operations.js");
+    const { q } = await import("../src/db/index.js");
+
+    const node = await api("POST", "/api/v1/nodes", {
+      name: "OPC-01",
+      role: "vpn",
+      regionClass: "iran",
+      country: "Iran",
+      provider: "dc-ir",
+    });
+    expect(node.statusCode).toBe(200);
+    const nodeId = node.json().node.id as string;
+
+    const op = await enqueueOperation({
+      type: "TestTunnel",
+      nodeId,
+      refType: "tunnel",
+      refId: null,
+      input: { interfaceName: "opc", remoteTunnelIp: "10.200.0.2", mtu: 1452 },
+    });
+
+    // The real race: an agent that polls twice at the same moment (retry while
+    // the previous poll is in flight) must not execute the same operation twice.
+    const claims = await Promise.all([claimNextOperation(nodeId), claimNextOperation(nodeId)]);
+    const nonEmpty = claims.filter((c) => c !== null);
+    expect(nonEmpty).toHaveLength(1);
+    expect(nonEmpty[0]).toMatchObject({ id: op.id, type: "TestTunnel" });
+
+    // Once claimed, nothing else is handed out and the row reflects that.
+    expect(await claimNextOperation(nodeId)).toBeNull();
+    const rows = await q<{ status: string; claimed_at: string | null }>(
+      `SELECT status, claimed_at FROM operations WHERE id = ?`,
+      op.id,
+    );
+    expect(rows[0]?.status).toBe("running");
+    expect(rows[0]?.claimed_at).not.toBeNull();
+  });
+
+  it("does not hand out an operation that already finished", async () => {
+    const { claimNextOperation } = await import("../src/services/operations.js");
+    const { q } = await import("../src/db/index.js");
+    const nodeId = (await q<{ id: string }>(`SELECT id FROM nodes WHERE name = 'OPC-01'`))[0]!.id;
+    const finished = (await q<{ id: string }>(`SELECT id FROM operations WHERE node_id = ? LIMIT 1`, nodeId))[0]!;
+    await q(`UPDATE operations SET status = 'success' WHERE id = ?`, finished.id);
+    expect(await claimNextOperation(nodeId)).toBeNull();
+  });
+});
+
 describe("security hardening", () => {
   it("marks every response as non-indexable and never leaks a server banner", async () => {
     const res = await app.inject({ method: "GET", url: "/api/v1/health" });
@@ -556,6 +626,29 @@ describe("security hardening", () => {
     expect(res.headers["referrer-policy"]).toBe("no-referrer");
     expect(res.headers["cache-control"]).toBe("no-store");
     expect(res.headers["x-powered-by"]).toBeUndefined();
+  });
+
+  // A malformed request is the caller's mistake. Reporting it as an unhandled
+  // 500 told operators the control plane was broken and buried the real error in
+  // the log, so the transport-level 4xx is asserted here explicitly.
+  it("answers a malformed body with a client error instead of an unhandled 500", async () => {
+    const emptyJson = await app.inject({
+      method: "POST",
+      url: "/api/v1/nodes",
+      headers: { authorization: `Bearer ${adminToken}`, "content-type": "application/json" },
+      payload: "",
+    });
+    expect(emptyJson.statusCode).toBe(400);
+    expect(emptyJson.json().error.message).toMatch(/body/i);
+
+    const wrongType = await app.inject({
+      method: "POST",
+      url: "/api/v1/nodes",
+      headers: { authorization: `Bearer ${adminToken}`, "content-type": "application/xml" },
+      payload: "<node />",
+    });
+    expect(wrongType.statusCode).toBe(415);
+    expect(typeof wrongType.json().error.message).toBe("string");
   });
 
   it("rejects a cookie-authenticated state change without the CSRF header", async () => {
@@ -815,6 +908,316 @@ describe("continuous path health engine", () => {
 
     const removed = await api("DELETE", `/api/v1/tunnels/${probeTunnelId}`);
     expect(removed.statusCode).toBe(200);
+  });
+});
+
+describe("node lifecycle: credential reveal/rotate/revoke, decommission, delete", () => {
+  const capabilities = JSON.stringify({
+    gre: true,
+    fou: true,
+    ipsec: { available: false, tool: null, version: null },
+    nftables: true,
+    dco: { supported: false, reason: "test" },
+    openvpnVersion: "2.6.12",
+    kernel: "6.8.0",
+  });
+
+  /** Create a node, enroll it for real, approve it and give it an address. */
+  async function enrollNode(name: string, address: string, regionClass: "iran" | "international" = "iran") {
+    const created = await api("POST", "/api/v1/nodes", {
+      name,
+      role: "vpn",
+      regionClass,
+      country: regionClass === "iran" ? "Iran" : "Germany",
+      provider: regionClass === "iran" ? "dc-ir" : "dc-de",
+    });
+    expect(created.statusCode).toBe(200);
+    const id = created.json().node.id as string;
+    const hello = await app.inject({
+      method: "POST",
+      url: "/api/v1/agent/hello",
+      payload: {
+        enrollmentToken: created.json().enrollment.token as string,
+        hostname: `${name.toLowerCase()}.example`,
+        platform: "linux",
+        agentVersion: "0.1.0",
+      },
+    });
+    expect(hello.statusCode).toBe(200);
+    const secret = hello.json().nodeSecret as string;
+    expect((await api("POST", `/api/v1/nodes/${id}/approve`)).statusCode).toBe(200);
+    const { run, nowIso } = await import("../src/db/index.js");
+    await run(
+      `UPDATE nodes SET address = ?, capabilities = ?, capabilities_at = ?, status = 'online' WHERE id = ?`,
+      address,
+      capabilities,
+      nowIso(),
+      id,
+    );
+    return { id, secret };
+  }
+
+  const heartbeat = (id: string, secret: string) =>
+    app.inject({
+      method: "POST",
+      url: "/api/v1/agent/heartbeat",
+      payload: { telemetry },
+      headers: { authorization: `Bearer arvoo-node ${id}:${secret}` },
+    });
+
+  let primary = { id: "", secret: "" };
+  let peer = { id: "", secret: "" };
+  let tunnelId = "";
+  const tunnelName = "nl-tunnel";
+
+  it("keeps the credential out of every list and record response", async () => {
+    primary = await enrollNode("NL-01", "203.0.113.61");
+    peer = await enrollNode("NL-02", "203.0.113.62", "international");
+
+    const nodes = await api("GET", "/api/v1/nodes");
+    expect(nodes.statusCode).toBe(200);
+    expect(JSON.stringify(nodes.json())).not.toContain(primary.secret);
+    expect(JSON.stringify(nodes.json())).not.toContain("node_secret");
+
+    const detail = await api("GET", `/api/v1/nodes/${primary.id}`);
+    expect(JSON.stringify(detail.json())).not.toContain(primary.secret);
+
+    const info = await api("GET", `/api/v1/nodes/${primary.id}/token`);
+    expect(info.statusCode).toBe(200);
+    expect(info.json().token.status).toBe("active");
+    expect(info.json().token.revealable).toBe(true);
+    expect(info.json().token.issuedAt).not.toBeNull();
+    expect(JSON.stringify(info.json())).not.toContain(primary.secret);
+  });
+
+  it("reveals the credential that the agent actually authenticates with, and audits it without the value", async () => {
+    const reveal = await api("POST", `/api/v1/nodes/${primary.id}/token/reveal`);
+    expect(reveal.statusCode).toBe(200);
+    expect(reveal.json().token.secret).toBe(primary.secret);
+
+    // The value is real: it authenticates.
+    expect((await heartbeat(primary.id, reveal.json().token.secret)).statusCode).toBe(200);
+
+    const entries = await api("GET", "/api/v1/audit?action=node.token.reveal&limit=5");
+    expect(entries.json().entries.length).toBeGreaterThanOrEqual(1);
+    expect(JSON.stringify(entries.json())).not.toContain(primary.secret);
+  });
+
+  it("never fabricates a reveal for a legacy hash-only enrollment", async () => {
+    // A node enrolled before 0006 has a hash and no encrypted copy. The API must
+    // say so (and how to fix it) instead of returning an empty or invented token.
+    const { run } = await import("../src/db/index.js");
+    await run(`UPDATE nodes SET node_secret_encrypted = NULL WHERE id = ?`, peer.id);
+
+    const info = await api("GET", `/api/v1/nodes/${peer.id}/token`);
+    expect(info.json().token.revealable).toBe(false);
+    expect(info.json().token.reason).toMatch(/rotate/i);
+
+    const reveal = await api("POST", `/api/v1/nodes/${peer.id}/token/reveal`);
+    expect(reveal.statusCode).toBe(409);
+    expect(reveal.json().error.message).toMatch(/rotate/i);
+
+    // Rotating fixes it, and the new credential is returned at once.
+    const rotate = await api("POST", `/api/v1/nodes/${peer.id}/token/rotate`);
+    expect(rotate.statusCode).toBe(200);
+    expect(rotate.json().token.revealable).toBe(true);
+    peer = { ...peer, secret: rotate.json().token.secret as string };
+    expect((await api("POST", `/api/v1/nodes/${peer.id}/token/reveal`)).json().token.secret).toBe(peer.secret);
+  });
+
+  it("rotation shows the new credential immediately and the old one stops authenticating", async () => {
+    const oldSecret = primary.secret;
+    const rotate = await api("POST", `/api/v1/nodes/${primary.id}/token/rotate`);
+    expect(rotate.statusCode).toBe(200);
+    const fresh = rotate.json().token.secret as string;
+    expect(fresh).toMatch(/^arvnode_/);
+    expect(fresh).not.toBe(oldSecret);
+    expect(rotate.json().token.rotatedAt).not.toBeNull();
+    expect(rotate.json().token.applyCommand).toContain("/var/lib/arvoo/agent-state.json");
+
+    expect((await heartbeat(primary.id, oldSecret)).statusCode).toBe(401);
+    expect((await heartbeat(primary.id, fresh)).statusCode).toBe(200);
+    primary = { ...primary, secret: fresh };
+  });
+
+  it("reports the dependencies that block deletion, and refuses to delete through them", async () => {
+    const tunnel = await api("POST", "/api/v1/tunnels", {
+      name: tunnelName,
+      sourceNodeId: primary.id,
+      destNodeId: peer.id,
+    });
+    expect(tunnel.statusCode).toBe(200);
+    tunnelId = tunnel.json().tunnel.id as string;
+
+    const deps = await api("GET", `/api/v1/nodes/${primary.id}/dependencies`);
+    expect(deps.statusCode).toBe(200);
+    const d = deps.json().dependencies;
+    expect(d.deletable).toBe(false);
+    expect(d.blocking.tunnels.map((t: { name: string }) => t.name)).toContain(tunnelName);
+    expect(d.managed.interfaces).toContain(tunnelName);
+    expect(d.summary).toMatch(/cannot be deleted/i);
+
+    // A tunnel names the node: this is refused with or without force.
+    const del = await api("DELETE", `/api/v1/nodes/${primary.id}`);
+    expect(del.statusCode).toBe(409);
+    expect(del.json().error.message).toMatch(/tunnel/i);
+    const forced = await api("DELETE", `/api/v1/nodes/${primary.id}?force=true`);
+    expect(forced.statusCode).toBe(409);
+  });
+
+  it("decommissioning revokes the credential and queues cleanup for exactly what the panel owns", async () => {
+    const res = await api("POST", `/api/v1/nodes/${primary.id}/decommission`);
+    expect(res.statusCode).toBe(200);
+    expect(res.json().decommission.decommissionState).toBe("requested");
+
+    // The credential is dead immediately - the agent cannot keep working.
+    expect((await heartbeat(primary.id, primary.secret)).statusCode).toBe(401);
+    expect((await api("POST", "/api/v1/agent/operations", {})).statusCode).toBe(404);
+
+    const { q } = await import("../src/db/index.js");
+    const ops = await q<{ id: string; input: string; ref_type: string }>(
+      `SELECT id, input, ref_type FROM operations WHERE node_id = ? AND type = 'CleanupNode'`,
+      primary.id,
+    );
+    expect(ops).toHaveLength(1);
+    expect(ops[0]?.ref_type).toBe("node");
+    const input = JSON.parse(ops[0]!.input) as { interfaceNames: string[]; inboundNames: string[] };
+    // Exactly the resources the panel created here - nothing else.
+    expect(input.interfaceNames).toEqual([tunnelName]);
+    expect(input.inboundNames).toEqual([]);
+
+    const node = await api("GET", `/api/v1/nodes/${primary.id}`);
+    expect(node.json().node.decommissionState).toBe("requested");
+    expect(node.json().node.tokenRevokedAt).not.toBeNull();
+  });
+
+  it("records the host cleanup result instead of assuming it", async () => {
+    const { settleOperation } = await import("../src/services/settle.js");
+    const { q, run, nowIso } = await import("../src/db/index.js");
+    const op = (await q<{ id: string }>(`SELECT id FROM operations WHERE node_id = ? AND type = 'CleanupNode'`, primary.id))[0]!;
+
+    // The node reports that one interface could not be removed: the state must
+    // stay partial rather than claiming the host is clean.
+    await run(`UPDATE operations SET status = 'running' WHERE id = ?`, op.id);
+    await settleOperation(op.id, false, {
+      output: { removed: [], absent: [], failed: [{ name: `interface:${tunnelName}`, error: "RTNETLINK answers: Operation not permitted" }] },
+      error: "Cleanup incomplete",
+    });
+    let node = await api("GET", `/api/v1/nodes/${primary.id}`);
+    expect(node.json().node.decommissionState).toBe("partial");
+    expect(node.json().node.decommissionDetail).toMatch(/not permitted/i);
+
+    // Release the tunnel the interface belonged to, then the record must still
+    // refuse deletion: the host was never confirmed clean.
+    const dropTunnel = await api("DELETE", `/api/v1/tunnels/${tunnelId}`);
+    expect(dropTunnel.statusCode).toBe(200);
+    const del = await api("DELETE", `/api/v1/nodes/${primary.id}`);
+    expect(del.statusCode).toBe(409);
+    expect(del.json().error.message).toMatch(/pending host cleanup/i);
+
+    // A successful re-run of cleanup flips it to complete.
+    await run(`UPDATE nodes SET decommission_state = 'requested', updated_at = ? WHERE id = ?`, nowIso(), primary.id);
+    await run(`UPDATE operations SET status = 'running' WHERE id = ?`, op.id);
+    await settleOperation(op.id, true, { output: { removed: [`interface:${tunnelName}`], absent: [], failed: [] }, error: null });
+    node = await api("GET", `/api/v1/nodes/${primary.id}`);
+    expect(node.json().node.decommissionState).toBe("complete");
+  });
+
+  it("tracks an unreachable node's cleanup honestly and deletes it only with force", async () => {
+    // The realistic recovery path: a node that owns real resources is
+    // decommissioned, the host stops answering, those resources are released in
+    // the panel, and only then is the record force-deleted - with the pending
+    // cleanup recorded instead of silently forgotten.
+    const offline = await enrollNode("NL-03", "203.0.113.63");
+    const spare = await enrollNode("NL-04", "203.0.113.64", "international");
+    const { run } = await import("../src/db/index.js");
+
+    const tunnel = await api("POST", "/api/v1/tunnels", {
+      name: "nl-off3",
+      sourceNodeId: offline.id,
+      destNodeId: spare.id,
+    });
+    expect(tunnel.statusCode).toBe(200);
+    const offlineTunnelId = tunnel.json().tunnel.id as string;
+
+    const queued = await api("POST", `/api/v1/nodes/${offline.id}/decommission`);
+    expect(queued.json().decommission.decommissionState).toBe("requested");
+    const cleanupOp = queued.json().decommission.operationId as string;
+    expect(cleanupOp).toBeTruthy();
+
+    // The host never reports back: the state must say partial, not done.
+    const { settleOperation } = await import("../src/services/settle.js");
+    await run(`UPDATE operations SET status = 'running' WHERE id = ?`, cleanupOp);
+    await run(`UPDATE nodes SET status = 'offline' WHERE id = ?`, offline.id);
+    await settleOperation(cleanupOp, false, { output: null, error: "Operation timed out: node agent did not report a result" });
+
+    const deps = await api("GET", `/api/v1/nodes/${offline.id}/dependencies`);
+    expect(deps.json().dependencies.decommissionState).toBe("partial");
+    expect(deps.json().dependencies.decommissionDetail).toMatch(/did not report/i);
+
+    // Releasing the resources in the panel is what makes the record deletable; the
+    // tunnel delete reports honestly that the offline node kept its files.
+    const dropTunnel = await api("DELETE", `/api/v1/tunnels/${offlineTunnelId}`);
+    expect(dropTunnel.statusCode).toBe(200);
+
+    const refused = await api("DELETE", `/api/v1/nodes/${offline.id}`);
+    expect(refused.statusCode).toBe(409);
+    expect(refused.json().error.message).toMatch(/pending host cleanup/i);
+
+    const forced = await api("DELETE", `/api/v1/nodes/${offline.id}?force=true`);
+    expect(forced.statusCode).toBe(200);
+    expect(String(forced.json().deleted.pendingCleanup)).toMatch(/pending host cleanup|did not report|removed/i);
+
+    // The peer is untouched and still authenticates.
+    expect((await heartbeat(spare.id, spare.secret)).statusCode).toBe(200);
+
+    // Gone from the panel...
+    expect((await api("GET", `/api/v1/nodes/${offline.id}`)).statusCode).toBe(404);
+    // ...and the agent cannot come back with the credential it had.
+    expect((await heartbeat(offline.id, offline.secret)).statusCode).toBe(401);
+
+    // The force-delete is auditable: what was left behind is in the audit trail.
+    const entries = await api("GET", "/api/v1/audit?action=node.delete&limit=10");
+    const entry = entries.json().entries.find((e: { entity_id: string }) => e.entity_id === offline.id);
+    expect(entry.summary).toMatch(/PENDING HOST CLEANUP/i);
+  });
+
+  it("decommissions a node with nothing to clean in one step", async () => {
+    const fresh = await enrollNode("NL-05", "203.0.113.65");
+    const decom = await api("POST", `/api/v1/nodes/${fresh.id}/decommission`);
+    expect(decom.statusCode).toBe(200);
+    expect(decom.json().decommission.decommissionState).toBe("complete");
+    expect(decom.json().decommission.operationId).toBeNull();
+
+    // No phantom cleanup operation was queued for a host with nothing on it.
+    const { q } = await import("../src/db/index.js");
+    const ops = await q(`SELECT id FROM operations WHERE node_id = ? AND type = 'CleanupNode'`, fresh.id);
+    expect(ops).toHaveLength(0);
+
+    const removed = await api("DELETE", `/api/v1/nodes/${fresh.id}`);
+    expect(removed.statusCode).toBe(200);
+    expect(removed.json().deleted.forced).toBe(false);
+    expect((await heartbeat(fresh.id, fresh.secret)).statusCode).toBe(401);
+  });
+
+  it("deletes a fully decommissioned node and keeps its operation history", async () => {
+    const removed = await api("DELETE", `/api/v1/nodes/${primary.id}`);
+    expect(removed.statusCode).toBe(200);
+    expect(removed.json().deleted.pendingCleanup).toBeNull();
+    expect((await api("GET", `/api/v1/nodes/${primary.id}`)).statusCode).toBe(404);
+
+    // Operation history survives with a NULL node reference: it is not erased
+    // to satisfy a foreign key.
+    const { q } = await import("../src/db/index.js");
+    const history = await q<{ node_id: string | null; type: string }>(
+      `SELECT node_id, type FROM operations WHERE ref_id = ? ORDER BY created_at`,
+      primary.id,
+    );
+    expect(history.length).toBeGreaterThan(0);
+    expect(history.every((h) => h.node_id === null)).toBe(true);
+
+    // The peer outlived it, and still authenticates.
+    expect((await heartbeat(peer.id, peer.secret)).statusCode).toBe(200);
   });
 });
 
@@ -1519,5 +1922,53 @@ describe("GRE keys (generation, validation, queue payload)", () => {
     const tunnel = res.json().tunnel as { id: string; key: string | null };
     created.push(tunnel.id);
     expect(tunnel.key).toBeNull();
+  });
+
+  it("queues TestTunnel with the exact configuration the node has to verify", async () => {
+    const res = await api("POST", "/api/v1/tunnels", { name: "gk-test", sourceNodeId, destNodeId });
+    expect(res.statusCode).toBe(200);
+    const tunnel = res.json().tunnel as { id: string };
+    created.push(tunnel.id);
+
+    const { q } = await import("../src/db/index.js");
+    const stored = (
+      await q<{
+        source_endpoint: string;
+        dest_endpoint: string;
+        local_tunnel_ip: string;
+        remote_tunnel_ip: string;
+        tunnel_network: string;
+        mtu: number;
+        ttl: number;
+        key: string | null;
+      }>(
+        `SELECT source_endpoint, dest_endpoint, local_tunnel_ip, remote_tunnel_ip, tunnel_network, mtu, ttl, key
+           FROM tunnels WHERE id = ?`,
+        tunnel.id,
+      )
+    )[0]!;
+
+    const test = await api("POST", `/api/v1/tunnels/${tunnel.id}/test`);
+    expect(test.statusCode).toBe(200);
+
+    const ops = await q<{ node_id: string; input: string }>(
+      `SELECT node_id, input FROM operations WHERE ref_type = 'tunnel' AND ref_id = ? AND type = 'TestTunnel'`,
+      tunnel.id,
+    );
+    expect(ops).toHaveLength(1);
+    expect(ops[0]?.node_id).toBe(sourceNodeId);
+    // The probe carries the expectation so the node compares it against the
+    // kernel instead of echoing back the values it was handed.
+    expect(JSON.parse(ops[0]!.input)).toMatchObject({
+      interfaceName: "gk-test",
+      localEndpoint: stored.source_endpoint,
+      remoteEndpoint: stored.dest_endpoint,
+      localTunnelIp: stored.local_tunnel_ip,
+      remoteTunnelIp: stored.remote_tunnel_ip,
+      tunnelNetwork: stored.tunnel_network,
+      mtu: Number(stored.mtu),
+      ttl: Number(stored.ttl),
+      key: stored.key,
+    });
   });
 });
