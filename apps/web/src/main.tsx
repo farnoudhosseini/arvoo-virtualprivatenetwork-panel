@@ -17,11 +17,21 @@ const queryClient = new QueryClient({
   },
 });
 
+/**
+ * Vite injects BASE_URL from `base` in vite.config (default "/").
+ * When the panel is built with VITE_BASE=/panel/, routes live under that prefix.
+ */
+function routerBasename(): string | undefined {
+  const raw = import.meta.env.BASE_URL || "/";
+  const trimmed = String(raw).replace(/\/$/, "");
+  return trimmed === "" || trimmed === "/" ? undefined : trimmed;
+}
+
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
     <QueryClientProvider client={queryClient}>
       <I18nProvider>
-        <BrowserRouter basename={import.meta.env.BASE_URL.replace(/\/$/, "") || "/"}>
+        <BrowserRouter basename={routerBasename()}>
           <Toaster
             theme="dark"
             position="bottom-right"

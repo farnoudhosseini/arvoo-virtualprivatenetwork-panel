@@ -590,7 +590,11 @@ build_app() {
   fi
   ok "dependencies installed (as ${APP_USER})"
 
-  run_as_app npm run build > /tmp/arvoo-build.log 2>&1 || {
+  # When the admin UI is served under a path (ARVOO_PANEL_PATH), Vite must emit
+  # asset URLs with that base. Default PANEL_PATH is /panel.
+  local vite_base="${PANEL_PATH}/"
+  [[ "$PANEL_PATH" == "/" ]] && vite_base="/"
+  run_as_app env VITE_BASE="$vite_base" npm run build > /tmp/arvoo-build.log 2>&1 || {
     tail -n 30 /tmp/arvoo-build.log >&2 || true
     abort "npm run build failed - see /tmp/arvoo-build.log"
   }
@@ -708,28 +712,57 @@ ask_domain() {
     validate_domain_dns "${ARVOO_DOMAIN}"
     return 0
   fi
-  if [[ "${ARVOO_NO_DOMAIN:-0}" == "1" || ! -t 0 ]]; then
-    warn "IP-based installation: the panel is served over HTTP without TLS."
+  # Explicit non-interactive IP install (CI / unattended).
+  if [[ "${ARVOO_NO_DOMAIN:-0}" == "1" ]]; then
+    warn "IP-based installation (ARVOO_NO_DOMAIN=1): the panel is served over HTTP without TLS."
     warn "  Keep it on a private network/VPN, or re-run with ARVOO_DOMAIN=<name> to enable HTTPS."
     return 0
   fi
+
+  # When the installer is piped (`curl ... | bash`), stdin is not a TTY.
+  # Always prompt on the controlling terminal so the operator can still choose
+  # a domain. Fall back to IP-only only when no TTY exists at all.
+  local tty="/dev/tty"
+  if [[ ! -r "$tty" || ! -w "$tty" ]]; then
+    if [[ ! -t 0 ]]; then
+      warn "No interactive terminal available and ARVOO_DOMAIN is unset."
+      warn "  Continuing with IP-based HTTP install. Set ARVOO_DOMAIN=... or ARVOO_NO_DOMAIN=1 to silence this."
+      return 0
+    fi
+    tty=""
+  fi
+
   echo
   echo "Do you have a domain for this panel?"
   echo "  1) Yes - configure HTTPS with a Let's Encrypt certificate (recommended)"
   echo "  2) No  - continue with this server's IP address over HTTP"
   local answer=""
-  read -r -p "Select [1/2]: " answer
-  case "${answer:-1}" in
+  if [[ -n "$tty" ]]; then
+    read -r -p "Select [1/2]: " answer <"$tty" || true
+  else
+    read -r -p "Select [1/2]: " answer || true
+  fi
+  case "${answer:-}" in
     1|y|Y|yes|YES)
       local domain=""
-      read -r -p "Domain (e.g. panel.example.com): " domain
+      if [[ -n "$tty" ]]; then
+        read -r -p "Domain (e.g. panel.example.com): " domain <"$tty" || true
+      else
+        read -r -p "Domain (e.g. panel.example.com): " domain || true
+      fi
       [[ -n "$domain" ]] || abort "a domain is required when HTTPS is selected (or choose 2 for an IP installation)"
       ARVOO_DOMAIN="${domain#http://}"; ARVOO_DOMAIN="${ARVOO_DOMAIN#https://}"; ARVOO_DOMAIN="${ARVOO_DOMAIN%%/*}"
       validate_domain_dns "${ARVOO_DOMAIN}"
+      ok "domain configured: ${ARVOO_DOMAIN} - HTTPS will be provisioned"
       ;;
-    *)
+    2|n|N|no|NO)
       warn "IP-based installation: no TLS certificate will be requested."
       warn "  Credentials cross the network in the clear - restrict access with firewall rules, or re-run with ARVOO_DOMAIN=<name>."
+      ;;
+    *)
+      # Empty answer when piped without TTY already handled above; empty on TTY defaults to asking again is noisy — prefer explicit IP with a clear message.
+      warn "No choice entered; defaulting to IP-based HTTP install."
+      warn "  Re-run with ARVOO_DOMAIN=panel.example.com for HTTPS, or answer 1 when prompted."
       ;;
   esac
 }
