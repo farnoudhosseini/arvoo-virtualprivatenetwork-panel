@@ -40,6 +40,12 @@ APP_GROUP="arvoo"
 DB_NAME="arvoo"
 DB_USER="arvoo_user"
 API_PORT="${ARVOO_API_PORT:-4001}"
+# Non-obvious URL path for the admin UI (camouflage). Fake marketing site stays at /.
+PANEL_PATH="${ARVOO_PANEL_PATH:-/panel}"
+# Normalise: leading slash, no trailing slash.
+PANEL_PATH="/${PANEL_PATH#/}"
+PANEL_PATH="${PANEL_PATH%/}"
+[[ -n "$PANEL_PATH" ]] || PANEL_PATH="/panel"
 PG_HOST="127.0.0.1"
 PG_PORT="5432"
 REQUIRED_NODE_MAJOR="22"
@@ -665,6 +671,12 @@ install_nginx() {
 
   mkdir -p /etc/nginx/snippets
   install -m 0644 "$INSTALL_ROOT/deploy/nginx-common.conf" /etc/nginx/snippets/arvoo-common.conf
+  # Camouflage: panel UI under a non-obvious path; public site at /.
+  sed -i -E \
+    -e "s|__PANEL_PATH__|${PANEL_PATH}|g" \
+    -e "s|__PANEL_ROOT__|${INSTALL_ROOT}/apps/web/dist|g" \
+    /etc/nginx/snippets/arvoo-common.conf
+
   install -m 0644 "$INSTALL_ROOT/deploy/nginx-arvoo.conf" /etc/nginx/sites-available/arvoo
 
   # Bind the vhost to the configured port/root instead of the defaults baked

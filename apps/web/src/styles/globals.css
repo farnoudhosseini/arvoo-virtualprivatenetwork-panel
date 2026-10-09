@@ -483,3 +483,17 @@ button {
     transform: rotate(360deg);
   }
 }
+
+/* --------------------------------------------------------------------------
+   RTL (Persian) support — driven by <html dir="rtl" lang="fa">
+   -------------------------------------------------------------------------- */
+html[dir="rtl"] {
+  direction: rtl;
+}
+html[dir="rtl"] .label-micro {
+  letter-spacing: 0.04em;
+}
+/* Flip chevrons that encode direction visually */
+html[dir="rtl"] .rotate-180 {
+  transform: rotate(-180deg);
+}

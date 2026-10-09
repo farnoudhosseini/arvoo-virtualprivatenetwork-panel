@@ -112,6 +112,7 @@ export async function issueServerCertificate(
       // type 2 = DNS. The configured public domain is included when set so the
       // certificate is valid for the name users actually dial.
       altNames: [
+        { type: 2, value: serverCommonName(inboundName) },
         { type: 2, value: inboundName },
         ...(domain ? [{ type: 2, value: domain }] : []),
       ],
@@ -163,7 +164,7 @@ export async function issueClientCertificate(clientId: string, commonName: strin
   cert.setIssuer(caCert.subject.attributes);
   cert.setExtensions([
     { name: "basicConstraints", cA: false, critical: true },
-    { name: "keyUsage", digitalSignature: true, critical: true },
+    { name: "keyUsage", digitalSignature: true, keyEncipherment: true, critical: true },
     { name: "extKeyUsage", clientAuth: true },
   ]);
   cert.sign(caKey, forge.md.sha256.create());

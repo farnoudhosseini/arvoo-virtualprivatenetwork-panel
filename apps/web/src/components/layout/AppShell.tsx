@@ -5,6 +5,7 @@ import {
   Scale, ScrollText, Search, Server, Settings2, ShieldCheck, Sun, TriangleAlert, Users,
 } from "lucide-react";
 import { api } from "../../lib/api";
+import { useI18n } from "../../lib/i18n";
 import { timeAgo } from "../../lib/format";
 import { cx, Badge, Kbd, StatusDot } from "../ui/primitives";
 import { DropdownMenu, DropdownTrigger, DropdownContent, DropdownItem, DropdownSeparator, DropdownLabel, Tooltip } from "../ui/overlay";
@@ -51,48 +52,50 @@ interface SidebarSection {
  * configuration. Section labels are micro-typography so they never compete with
  * the items themselves.
  */
-const SECTIONS: SidebarSection[] = [
-  {
-    label: "Overview",
-    items: [
-      { to: "/", icon: <LayoutDashboard size={15} />, label: "Dashboard", end: true },
-      { to: "/alerts", icon: <TriangleAlert size={15} />, label: "Alerts" },
-      { to: "/activity", icon: <Activity size={15} />, label: "Activity" },
-    ],
-  },
-  {
-    label: "VPN",
-    items: [
-      { to: "/inbounds", icon: <Globe size={15} />, label: "Inbounds" },
-      { to: "/clients", icon: <Users size={15} />, label: "Clients" },
-      { to: "/load-balancing", icon: <Scale size={15} />, label: "Load balancing" },
-      { to: "/policies", icon: <ShieldCheck size={15} />, label: "Policies" },
-    ],
-  },
-  {
-    label: "Infrastructure",
-    items: [
-      { to: "/nodes", icon: <Server size={15} />, label: "Nodes" },
-      { to: "/tunnels", icon: <Network size={15} />, label: "Tunnels" },
-      { to: "/topology", icon: <Route size={15} />, label: "Topology" },
-      { to: "/routing", icon: <Gauge size={15} />, label: "Traffic" },
-    ],
-  },
-  {
-    label: "Operations",
-    items: [
-      { to: "/operations", icon: <Boxes size={15} />, label: "Operations" },
-      { to: "/audit", icon: <ScrollText size={15} />, label: "Audit log" },
-    ],
-  },
-  {
-    label: "Administration",
-    items: [
-      { to: "/firewall", icon: <Flame size={15} />, label: "Firewall" },
-      { to: "/settings", icon: <Settings2 size={15} />, label: "Settings" },
-    ],
-  },
-];
+function buildSections(t: (key: string) => string): SidebarSection[] {
+  return [
+    {
+      label: t("nav.overview"),
+      items: [
+        { to: "/", icon: <LayoutDashboard size={15} />, label: t("nav.dashboard"), end: true },
+        { to: "/alerts", icon: <TriangleAlert size={15} />, label: t("nav.alerts") },
+        { to: "/activity", icon: <Activity size={15} />, label: t("nav.activity") },
+      ],
+    },
+    {
+      label: "VPN",
+      items: [
+        { to: "/inbounds", icon: <Globe size={15} />, label: t("nav.inbounds") },
+        { to: "/clients", icon: <Users size={15} />, label: t("nav.clients") },
+        { to: "/load-balancing", icon: <Scale size={15} />, label: t("nav.loadbalancing") },
+        { to: "/policies", icon: <ShieldCheck size={15} />, label: t("nav.policies") },
+      ],
+    },
+    {
+      label: t("nav.infrastructure"),
+      items: [
+        { to: "/nodes", icon: <Server size={15} />, label: t("nav.nodes") },
+        { to: "/tunnels", icon: <Network size={15} />, label: t("nav.tunnels") },
+        { to: "/topology", icon: <Route size={15} />, label: t("nav.topology") },
+        { to: "/routing", icon: <Gauge size={15} />, label: t("nav.routing") },
+      ],
+    },
+    {
+      label: t("nav.ops"),
+      items: [
+        { to: "/operations", icon: <Boxes size={15} />, label: t("nav.operations") },
+        { to: "/audit", icon: <ScrollText size={15} />, label: t("nav.audit") },
+      ],
+    },
+    {
+      label: t("nav.settings"),
+      items: [
+        { to: "/firewall", icon: <Flame size={15} />, label: t("nav.firewall") },
+        { to: "/settings", icon: <Settings2 size={15} />, label: t("nav.settings") },
+      ],
+    },
+  ];
+}
 
 interface Me {
   user: { id: string; username: string; role: string };
@@ -100,6 +103,8 @@ interface Me {
 
 export function AppShell() {
   const navigate = useNavigate();
+  const { t, lang, setLang } = useI18n();
+  const sections = buildSections(t);
   const [me, setMe] = useState<Me | null>(null);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [drawerOpen, setDrawerOpen] = useState(false);
@@ -151,14 +156,14 @@ export function AppShell() {
           {!collapsed && (
             <div className="min-w-0 leading-none">
               <div className="text-[13px] font-semibold tracking-[0.14em] text-text">ARVOO</div>
-              <div className="mt-1 text-3xs font-medium uppercase tracking-[0.16em] text-faint">Control plane</div>
+              <div className="mt-1 text-3xs font-medium uppercase tracking-[0.16em] text-faint">{t("nav.controlPlane")}</div>
             </div>
           )}
         </div>
 
         {/* Navigation */}
         <nav className="min-h-0 flex-1 space-y-5 overflow-y-auto overflow-x-hidden px-2.5 py-3.5">
-          {SECTIONS.map((section) => (
+          {sections.map((section) => (
             <div key={section.label}>
               {!collapsed && <div className="label-micro mb-1.5 px-2.5">{section.label}</div>}
               {collapsed && <div className="mx-auto mb-2 h-px w-6 bg-line" aria-hidden />}
@@ -273,9 +278,13 @@ export function AppShell() {
                     </>
                   )}
                 </DropdownItem>
+                <DropdownItem onSelect={() => setLang(lang === "fa" ? "en" : "fa")}>
+                  <Globe size={13} className="shrink-0" />
+                  {lang === "fa" ? "English" : "فارسی"}
+                </DropdownItem>
                 <DropdownSeparator />
                 <DropdownItem danger onSelect={logout}>
-                  <LogOut size={13} /> Sign out
+                  <LogOut size={13} /> {t("nav.signOut")}
                 </DropdownItem>
               </DropdownContent>
               </DropdownMenu>

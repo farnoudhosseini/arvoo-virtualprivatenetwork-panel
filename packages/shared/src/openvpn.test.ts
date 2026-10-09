@@ -151,10 +151,42 @@ describe("client ovpn", () => {
       dnsServers: ["1.1.1.1"],
       pushRoutes: [],
       profileName: "client-A",
+      verifyX509Name: "server-ovpn-inbound-01",
     });
     expect(text).toContain("remote 203.0.113.10 1194");
     expect(text).toContain("<ca>\nCA-BODY\n</ca>");
     expect(text).toContain("<tls-crypt>\nTLSKEY\n</tls-crypt>");
+    expect(text).not.toMatch(/^tls-crypt\s*$/m);
+    expect(text).toContain('verify-x509-name "server-ovpn-inbound-01" name');
+    expect(text).toContain("remote-cert-tls server");
     expect(text).toContain("redirect-gateway def1");
+  });
+
+  it("emits key-direction 1 and inline tls-auth without a bare directive", () => {
+    const text = generateClientOvpn({
+      serverAddress: "203.0.113.10",
+      port: 443,
+      transport: "tcp",
+      ca: "CA",
+      cert: "CERT",
+      key: "KEY",
+      tlsMode: "tls-auth",
+      tlsKey: "STATICKEY",
+      tlsVersionMin: "1.2",
+      dataCiphers: ["AES-256-GCM"],
+      fallbackCipher: "AES-256-CBC",
+      authDigest: "SHA256",
+      tunMtu: 1420,
+      mssFix: null,
+      redirectGateway: false,
+      dnsServers: [],
+      pushRoutes: [],
+      profileName: "compat-client",
+      verifyX509Name: "server-x",
+    });
+    expect(text).toContain("key-direction 1");
+    expect(text).toContain("<tls-auth>\nSTATICKEY\n</tls-auth>");
+    expect(text).not.toMatch(/^tls-auth\s*$/m);
+    expect(text).toContain('verify-x509-name "server-x" name');
   });
 });

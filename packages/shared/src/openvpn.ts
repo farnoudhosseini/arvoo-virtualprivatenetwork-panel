@@ -324,7 +324,11 @@ export function generateClientOvpn(opts: {
   lines.push(`persist-key`);
   lines.push(`persist-tun`);
   lines.push(`remote-cert-tls server`);
-  lines.push(`verify-x509-name ${opts.verifyX509Name ?? "server-name"}`);
+  // Explicit "name" type: match the certificate Common Name. OpenVPN Connect
+  // (OpenVPN 3) is strict about this; omitting the type or quoting incorrectly
+  // produces "Peer certificate verification failure".
+  const x509Name = opts.verifyX509Name ?? "server-name";
+  lines.push(`verify-x509-name "${x509Name}" name`);
   lines.push(`tls-version-min ${opts.tlsVersionMin}`);
   lines.push(`data-ciphers ${opts.dataCiphers.join(":")}`);
   if (opts.fallbackCipher) lines.push(`data-ciphers-fallback ${opts.fallbackCipher}`);
@@ -344,12 +348,13 @@ export function generateClientOvpn(opts: {
   lines.push(inline("ca", opts.ca));
   lines.push(inline("cert", opts.cert));
   lines.push(inline("key", opts.key));
+  // Inline blocks are the directive themselves — do not emit a bare
+  // `tls-crypt` / `tls-auth` line before the block (invalid for OpenVPN Connect).
   if (opts.tlsMode === "tls-crypt" && opts.tlsKey) {
-    lines.push(`tls-crypt`);
     lines.push(inline("tls-crypt", opts.tlsKey));
   }
   if (opts.tlsMode === "tls-auth" && opts.tlsKey) {
-    lines.push(`tls-auth`);
+    lines.push(`key-direction 1`);
     lines.push(inline("tls-auth", opts.tlsKey));
   }
   return lines.join("\n");

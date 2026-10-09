@@ -3,6 +3,9 @@ import react from "@vitejs/plugin-react";
 import path from "node:path";
 
 export default defineConfig({
+  // When the panel is served under a path (ARVOO_PANEL_PATH=/panel), the build
+  // must use the same base so asset URLs resolve. Default "/" for local dev.
+  base: process.env.VITE_BASE ?? "/",
   plugins: [react()],
   resolve: {
     alias: {
