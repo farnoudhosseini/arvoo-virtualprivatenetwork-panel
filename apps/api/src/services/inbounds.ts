@@ -480,10 +480,17 @@ export async function inboundOpInput(inboundId: string): Promise<Record<string, 
     }
   }
 
-  const egress =
-    cfg.deploymentMode === "through-tunnel" && cfg.tunnelId
-      ? await buildEgressContext(cfg.tunnelId, cfg.serverNetwork)
-      : null;
+  // OpenVPN agent expects egress = { egressInterface, masqueradeSourceNetworks[], forwardFromSubnet }
+  // or null. Through-tunnel NAT is applied on the *egress* node via ApplyFirewallPolicy
+  // (egressSide); never send the tunnel routing object as "egress" — the agent rejects it.
+  const openvpnEgress =
+    cfg.deploymentMode === "through-tunnel"
+      ? null
+      : {
+          egressInterface: null as string | null,
+          masqueradeSourceNetworks: [cfg.serverNetwork],
+          forwardFromSubnet: cfg.serverNetwork,
+        };
 
   return {
     inboundName: inbound.name,
@@ -504,7 +511,7 @@ export async function inboundOpInput(inboundId: string): Promise<Record<string, 
     // verified by the control plane on each connection (spec §39).
     authMode,
     clientNetwork: cfg.serverNetwork,
-    egress: egress?.ingressSide ?? null,
+    egress: openvpnEgress,
   };
 }
 
@@ -656,7 +663,7 @@ async function buildEgressContext(tunnelId: string, vpnSubnet: string) {
     },
     egressSide: {
       inboundName: tunnel.name,
-      masqueradeSourceNetworks: [vpnSubnet],
+      masqueradeSourceNetworks: Array.isArray(vpnSubnet) ? vpnSubnet : [vpnSubnet].filter(Boolean),
       forwardFromSubnet: vpnSubnet,
       routeViaTunnelIp: tunnel.local_tunnel_ip,
     },

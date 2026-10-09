@@ -753,7 +753,16 @@ ask_domain() {
       [[ -n "$domain" ]] || abort "a domain is required when HTTPS is selected (or choose 2 for an IP installation)"
       ARVOO_DOMAIN="${domain#http://}"; ARVOO_DOMAIN="${ARVOO_DOMAIN#https://}"; ARVOO_DOMAIN="${ARVOO_DOMAIN%%/*}"
       validate_domain_dns "${ARVOO_DOMAIN}"
-      ok "domain configured: ${ARVOO_DOMAIN} - HTTPS will be provisioned"
+      if [[ -z "${ARVOO_EMAIL:-}" ]]; then
+        local email_in=""
+        if [[ -n "$tty" ]]; then
+          read -r -p "Email for Let's Encrypt (e.g. admin@${ARVOO_DOMAIN}) [${ARVOO_DOMAIN:+admin@$ARVOO_DOMAIN}]: " email_in <"$tty" || true
+        else
+          read -r -p "Email for Let's Encrypt (e.g. admin@${ARVOO_DOMAIN}) [${ARVOO_DOMAIN:+admin@$ARVOO_DOMAIN}]: " email_in || true
+        fi
+        ARVOO_EMAIL="${email_in:-admin@${ARVOO_DOMAIN}}"
+      fi
+      ok "domain configured: ${ARVOO_DOMAIN} (ACME email: ${ARVOO_EMAIL}) - HTTPS will be provisioned"
       ;;
     2|n|N|no|NO)
       warn "IP-based installation: no TLS certificate will be requested."
@@ -795,6 +804,30 @@ cert_extra_domains() {
   [[ -n "${ARVOO_SITE_DOMAIN:-}" && "${ARVOO_SITE_DOMAIN}" != "${ARVOO_DOMAIN:-}" ]] && printf ' -d %s' "${ARVOO_SITE_DOMAIN}"
 }
 
+
+# Let's Encrypt rejects addresses like root@hostname. Prefer an explicit
+# ARVOO_EMAIL, then admin@domain, and only accept something that looks like
+# a real mailbox (has @ and a dot in the domain part).
+resolve_acme_email() {
+  local candidate="${ARVOO_EMAIL:-}"
+  if [[ -z "$candidate" && -n "${ARVOO_DOMAIN:-}" ]]; then
+    candidate="admin@${ARVOO_DOMAIN}"
+  fi
+  if [[ -z "$candidate" ]]; then
+    candidate="${ARVOO_CONTACT_EMAIL:-}"
+  fi
+  # Reject root@bare-hostname and anything without a dotted domain.
+  if [[ ! "$candidate" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]]; then
+    printf ''
+    return 0
+  fi
+  # Persist so renewals and re-runs keep the same account email.
+  if [[ -n "${ENV_FILE:-}" && -f "${ENV_FILE:-}" ]]; then
+    env_set ARVOO_EMAIL "$candidate" 2>/dev/null || true
+  fi
+  printf '%s' "$candidate"
+}
+
 configure_https() {
   [[ -n "${ARVOO_DOMAIN:-}" ]] || return 0
 
@@ -802,9 +835,17 @@ configure_https() {
   if [[ -f "/etc/letsencrypt/live/${ARVOO_DOMAIN}/fullchain.pem" ]]; then
     ok "certificate already present"
   else
+    local acme_email
+    acme_email="$(resolve_acme_email)"
+    if [[ -z "$acme_email" ]]; then
+      warn "No valid ACME email available; skipping certificate. Set ARVOO_EMAIL=you@example.com and re-run."
+      return 0
+    fi
     if ! certbot certonly --nginx --non-interactive --agree-tos \
-          -m "${ARVOO_EMAIL:-root@$(hostname)}" -d "${ARVOO_DOMAIN}" $(cert_extra_domains); then
-      warn "certbot failed; panel stays HTTP-only. Fix DNS/ports and re-run ./install.sh"
+          -m "$acme_email" -d "${ARVOO_DOMAIN}" $(cert_extra_domains); then
+      warn "certbot failed; panel stays HTTP-only."
+      warn "  Common causes: DNS not pointing here, ports 80/443 closed, or invalid email."
+      warn "  Fix and re-run: ARVOO_DOMAIN=${ARVOO_DOMAIN} ARVOO_EMAIL=you@example.com ./install.sh"
       return 0
     fi
     ok "certificate issued"
@@ -859,6 +900,30 @@ server {
 
     location /.well-known/acme-challenge/ {
         root /var/www/html;
+    }
+
+    # Agent / health probes: some node networks complete TLS handshake but
+    # drop the HTTP response (PMTU / middlebox). Keep control-plane API on
+    # cleartext HTTP so enrollment and heartbeats still work; the panel UI
+    # stays HTTPS-only below.
+    location = /health {
+        proxy_pass http://arvoo_api;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        access_log off;
+    }
+    location /api/ {
+        proxy_pass http://arvoo_api;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        client_max_body_size 8m;
     }
 
     location / {
@@ -929,8 +994,21 @@ health_report() {
 service_state() { systemctl is-active "$1" 2>/dev/null || echo "n/a"; }
 
 final_report() {
-  local host_url="http://$(hostname -I 2>/dev/null | awk '{print $1}')"
-  [[ -n "${ARVOO_DOMAIN:-}" ]] && host_url="https://${ARVOO_DOMAIN}"
+  local ip host_url scheme public_ports panel_url site_url
+  ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  ip="${ip:-127.0.0.1}"
+  if [[ -n "${ARVOO_DOMAIN:-}" ]]; then
+    scheme="https"
+    host_url="https://${ARVOO_DOMAIN}"
+    public_ports="80 (HTTP redirect), 443 (HTTPS)"
+  else
+    scheme="http"
+    host_url="http://${ip}"
+    public_ports="80 (HTTP)"
+  fi
+  # PANEL_PATH is normalised to "/panel" (leading slash, no trailing slash).
+  panel_url="${host_url}${PANEL_PATH}/"
+  site_url="${host_url}/"
   local admin_pw
   admin_pw="$(env_get ARVOO_ADMIN_PASSWORD)"
 
@@ -939,16 +1017,20 @@ final_report() {
   echo "        ARVOO INSTALLATION COMPLETE"
   echo "========================================"
   echo
-  printf "%-11s : %s\n" "Application" "OK"
-  printf "%-11s : %s\n" "PostgreSQL" "$(service_state postgresql | sed 's/active/OK/')"
-  printf "%-11s : %s\n" "Migrations" "OK"
-  printf "%-11s : %s\n" "Backend" "$(service_state arvoo | sed 's/active/OK/')"
-  printf "%-11s : %s\n" "Frontend" "OK ($(du -sh "$INSTALL_ROOT/apps/web/dist" 2>/dev/null | cut -f1))"
-  printf "%-11s : %s\n" "Nginx" "$(service_state nginx | sed 's/active/OK/')"
-  printf "%-11s : %s\n" "Backup" "cron 02:30 -> ${BACKUP_DIR}"
+  printf "%-14s : %s\n" "Application" "OK"
+  printf "%-14s : %s\n" "PostgreSQL" "$(service_state postgresql | sed 's/active/OK/')"
+  printf "%-14s : %s\n" "Migrations" "OK"
+  printf "%-14s : %s\n" "Backend" "$(service_state arvoo | sed 's/active/OK/')"
+  printf "%-14s : %s\n" "Frontend" "OK ($(du -sh "$INSTALL_ROOT/apps/web/dist" 2>/dev/null | cut -f1))"
+  printf "%-14s : %s\n" "Nginx" "$(service_state nginx | sed 's/active/OK/')"
+  printf "%-14s : %s\n" "Backup" "cron 02:30 -> ${BACKUP_DIR}"
   echo
-  printf "%-11s : %s\n" "Backend" "127.0.0.1:${API_PORT} (loopback only)"
-  printf "%-11s : %s\n" "Web" "${host_url}"
+  echo "Access (open these in a browser):"
+  printf "%-14s : %s\n" "Panel URL" "${panel_url}"
+  printf "%-14s : %s\n" "Public site" "${site_url}"
+  printf "%-14s : %s\n" "Public ports" "${public_ports}"
+  printf "%-14s : %s\n" "API (internal)" "127.0.0.1:${API_PORT} (loopback only — not exposed)"
+  printf "%-14s : %s\n" "Panel path" "${PANEL_PATH}/"
   echo
   echo "Services:"
   printf "  %-22s %s\n" "arvoo.service" "$(service_state arvoo)"
@@ -1571,7 +1653,12 @@ install_public_site() {
   done
   ok "public site installed at ${root} (domain: ${site_domain}, contact: ${contact})"
 
+  # The main arvoo vhost (snippet arvoo-common.conf) already serves the public
+  # site at / and the admin UI at PANEL_PATH. A second default_server would
+  # conflict ("duplicate default server for 0.0.0.0:80"). Only create a
+  # separate vhost when a distinct ARVOO_SITE_DOMAIN is configured.
   local conf="/etc/nginx/sites-available/arvoo-site"
+  rm -f /etc/nginx/sites-enabled/arvoo-site
   if [[ -n "${ARVOO_SITE_DOMAIN:-}" && "${ARVOO_SITE_DOMAIN}" != "${ARVOO_DOMAIN:-}" ]]; then
     cat > "$conf" <<NGINX
 server {
@@ -1588,34 +1675,25 @@ server {
     add_header Content-Security-Policy "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; frame-ancestors 'none'" always;
 }
 NGINX
+    ln -sf "$conf" /etc/nginx/sites-enabled/arvoo-site
+    if nginx -t > /dev/null 2>&1; then
+      systemctl reload nginx 2>/dev/null || systemctl restart nginx
+      ok "nginx serves the public site on ${ARVOO_SITE_DOMAIN}"
+    else
+      warn "nginx configuration test failed for the public site; the panel is unaffected"
+      nginx -t || true
+      rm -f /etc/nginx/sites-enabled/arvoo-site
+    fi
   else
-    # No separate site domain: answer for any host that is not the panel, so the
-    # public page exists on an IP-only installation too. The panel keeps its own
-    # server_name (and TLS) block.
-    cat > "$conf" <<NGINX
-server {
-    listen 80 default_server;
-    listen [::]:80 default_server;
-    server_name _;
-
-    location /.well-known/acme-challenge/ { root /var/www/html; }
-    location / { root ${root}; index index.html; try_files \$uri \$uri/ /index.html; }
-
-    add_header X-Content-Type-Options "nosniff" always;
-    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
-    add_header Content-Security-Policy "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; frame-ancestors 'none'" always;
-}
-NGINX
-  fi
-
-  ln -sf "$conf" /etc/nginx/sites-enabled/arvoo-site
-  if nginx -t > /dev/null 2>&1; then
-    systemctl reload nginx 2>/dev/null || systemctl restart nginx
-    ok "nginx now serves the public site"
-  else
-    warn "nginx configuration test failed for the public site; the panel is unaffected"
-    nginx -t || true
-    rm -f /etc/nginx/sites-enabled/arvoo-site
+    # Files are on disk; the main arvoo vhost serves them at /. No extra vhost.
+    rm -f "$conf"
+    if nginx -t > /dev/null 2>&1; then
+      systemctl reload nginx 2>/dev/null || true
+      ok "public site content ready (served by the main arvoo vhost at /)"
+    else
+      warn "nginx test failed after public site install; check: nginx -t"
+      nginx -t || true
+    fi
   fi
 }
 
@@ -1665,13 +1743,30 @@ ask_control_plane_url() {
 }
 
 validate_control_plane() {
-  local url="$1" health
-  health="$(curl -fsS --max-time 20 "${url}/health" 2>/dev/null)" \
-    || abort "the control plane at ${url} did not answer ${url}/health. Check the URL, DNS and that the panel is running."
+  local url="$1" health err http_code
+  # Capture body + status so a TLS/404/502 failure is actionable, not opaque.
+  err="$(mktemp)"
+  health="$(curl -fsS --max-time 20 -w "\n%{http_code}" "${url}/health" 2>"$err" || true)"
+  http_code="$(printf '%s' "$health" | tail -n1)"
+  health="$(printf '%s' "$health" | sed '$d')"
+  if [[ -z "$health" || "$http_code" != "200" ]]; then
+    local detail
+    detail="$(tr '\n' ' ' <"$err" | head -c 400)"
+    rm -f "$err"
+    abort "control plane health check failed for ${url}/health (HTTP ${http_code:-none}).
+  curl: ${detail:-no details}
+  On the panel host verify:
+    systemctl is-active arvoo nginx
+    curl -sS http://127.0.0.1:4001/health
+    curl -sS ${url}/health
+  If HTTPS fails but HTTP works, use http://... temporarily or fix the certificate:
+    certbot certonly --nginx -d ${ARVOO_DOMAIN:-YOUR_DOMAIN} -m you@example.com"
+  fi
+  rm -f "$err"
   if printf '%s' "$health" | grep -q '"status":"ok"'; then
     ok "control plane reachable and healthy (${url})"
   else
-    warn "control plane answered but did not report status:ok: ${health}"
+    warn "control plane answered HTTP ${http_code} but did not report status:ok: ${health}"
   fi
 }
 
@@ -1710,12 +1805,24 @@ enroll_agent() {
 
   local token="${ARVOO_ENROLLMENT_TOKEN:-}"
   if [[ -z "$token" ]]; then
-    if [[ -t 0 ]]; then
+    local tty=""
+    if [[ -r /dev/tty && -w /dev/tty ]]; then
+      tty="/dev/tty"
+    elif [[ -t 0 ]]; then
+      tty=""
+    else
+      tty=""
+    fi
+    if [[ -n "$tty" || -t 0 ]]; then
       echo >&2
       echo "One-time Node enrollment token:" >&2
       echo "  Generate it in the panel: Nodes -> Add node -> enrollment token." >&2
       echo "  It is single use and expires in a few minutes." >&2
-      read -r -s -p "  " token
+      if [[ -n "$tty" ]]; then
+        read -r -s -p "  " token <"$tty" || true
+      else
+        read -r -s -p "  " token || true
+      fi
       echo >&2
     fi
   fi
@@ -1738,6 +1845,38 @@ enroll_agent() {
     || abort "enrollment reported success but no identity was written to ${AGENT_STATE_DIR}; refusing to continue"
   chmod 0600 "$state_file"
   ok "node identity created (${state_file}, mode 0600)"
+}
+
+
+# Build the node agent from source when dist/ is missing (fresh git clone).
+ensure_agent_build() {
+  local entry="${NODE_AGENT_ROOT}/apps/agent/dist/index.js"
+  if [[ -f "$entry" ]]; then
+    ok "agent build present (${entry})"
+    return 0
+  fi
+  [[ -f "${NODE_AGENT_ROOT}/package.json" ]] \
+    || abort "no Arvoo checkout at ${NODE_AGENT_ROOT}; clone the repo there first"
+  [[ -f "${NODE_AGENT_ROOT}/apps/agent/package.json" ]] \
+    || abort "agent package missing at ${NODE_AGENT_ROOT}/apps/agent"
+
+  step "Building the node agent (dist/ not present — first install from source)"
+  cd "${NODE_AGENT_ROOT}"
+  if [[ -f package-lock.json ]]; then
+    npm ci --no-audit --no-fund > /tmp/arvoo-agent-install.log 2>&1 \
+      || { tail -n 40 /tmp/arvoo-agent-install.log >&2 || true; abort "npm ci failed - see /tmp/arvoo-agent-install.log"; }
+  else
+    npm install --no-audit --no-fund > /tmp/arvoo-agent-install.log 2>&1 \
+      || { tail -n 40 /tmp/arvoo-agent-install.log >&2 || true; abort "npm install failed - see /tmp/arvoo-agent-install.log"; }
+  fi
+  # Shared package is imported by the agent; build workspace packages the agent needs.
+  npm run build -w packages/shared > /tmp/arvoo-agent-build.log 2>&1 \
+    || true
+  npm run build -w apps/agent > /tmp/arvoo-agent-build.log 2>&1 \
+    || { tail -n 40 /tmp/arvoo-agent-build.log >&2 || true; abort "agent build failed - see /tmp/arvoo-agent-build.log"; }
+
+  [[ -f "$entry" ]] || abort "agent build finished but ${entry} is still missing"
+  ok "agent built at ${entry}"
 }
 
 mode_install_node() {
@@ -1766,8 +1905,7 @@ mode_install_node() {
   command_exists node || abort "Node.js did not install"
 
   step "Installing the agent"
-  [[ -f "${NODE_AGENT_ROOT}/apps/agent/dist/index.js" ]] \
-    || abort "agent build not found at ${NODE_AGENT_ROOT}/apps/agent/dist/index.js; copy the checkout there and run: npm ci && npm run build -w apps/agent"
+  ensure_agent_build
   install -d -m 0750 /var/lib/arvoo /etc/arvoo
   # Must exist before the agent unit is enabled: its ReadWritePaths contain
   # /etc/ufw and /var/lib/ufw, and a missing path makes systemd fail the unit

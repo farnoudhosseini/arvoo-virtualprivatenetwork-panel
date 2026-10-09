@@ -625,6 +625,9 @@ exec "$NODE_BIN" /etc/arvoo/openvpn/${inboundName}/hooks/auth-user-pass.js "$1"
  * quotes, backslashes or percent signs cannot corrupt the request.
  */
 function authUserPassHookJs(inboundName: string, controlPlaneUrl: string, nodeSecretFile: string): string {
+  // Prefer HTTP for the auth callback when the control plane is the same host:
+  // some node networks complete TLS handshake but drop the HTTP response.
+  const url = controlPlaneUrl.replace(/\/$/, "");
   return `#!/usr/bin/env node
 // Arvoo username/password verification helper - generated, do not edit.
 const fs = require("node:fs");
@@ -638,9 +641,10 @@ if (!credentialFile) {
 let username = "";
 let password = "";
 try {
-  const lines = fs.readFileSync(credentialFile, "utf8").split(/\r?\n/);
-  username = lines[0] ?? "";
-  password = lines[1] ?? "";
+  const raw = fs.readFileSync(credentialFile, "utf8");
+  const lines = raw.split("\\n").map(function (l) { return l.replace(/\\r$/, ""); });
+  username = lines[0] || "";
+  password = lines[1] || "";
 } catch (err) {
   console.error("arvoo: cannot read credential file:", err && err.message);
   process.exit(1);
@@ -649,47 +653,46 @@ try {
 const secret = fs.readFileSync("${nodeSecretFile}", "utf8").trim();
 const nodeId = fs.readFileSync("/etc/arvoo/node-id", "utf8").trim();
 const body = JSON.stringify({
-  username,
-  password,
+  username: username,
+  password: password,
   commonName: process.env.common_name || null,
   inboundName: "${inboundName}",
 });
 
 const controller = new AbortController();
-const timer = setTimeout(() => controller.abort(), 10000);
-fetch("${controlPlaneUrl}/api/v1/agent/openvpn-auth", {
+const timer = setTimeout(function () { controller.abort(); }, 10000);
+fetch("${url}/api/v1/agent/openvpn-auth", {
   method: "POST",
   headers: {
     Authorization: "Bearer arvoo-node " + nodeId + ":" + secret,
     "Content-Type": "application/json",
   },
-  body,
+  body: body,
   signal: controller.signal,
 })
-  .then(async (res) => {
+  .then(async function (res) {
     clearTimeout(timer);
     const text = await res.text();
-    let allow = false;
-    let reason = "unreadable response from control plane";
+    var allow = false;
+    var reason = "unreadable response from control plane";
     try {
-      const parsed = JSON.parse(text);
+      var parsed = JSON.parse(text);
       allow = parsed.allow === true;
-      reason = parsed.reason ?? reason;
-    } catch {
+      reason = parsed.reason || reason;
+    } catch (e) {
       reason = "control plane returned a non-JSON response";
     }
-    // Only the username and the reason are ever logged - never the password.
     if (!allow) console.error("arvoo: openvpn auth denied for " + username + ": " + reason);
     process.exit(allow ? 0 : 1);
   })
-  .catch((err) => {
+  .catch(function (err) {
     clearTimeout(timer);
-    // A control plane that cannot be reached is a denial, not an allow.
     console.error("arvoo: control plane unreachable for openvpn auth:", err && err.message);
     process.exit(1);
   });
 `;
 }
+
 
 export async function applyOpenVPNInbound(
   input: OpenVPNOpInput,
@@ -711,6 +714,26 @@ export async function applyOpenVPNInbound(
   await mkdir(`${dir}/hooks`, { recursive: true });
 
   await writeFile(`${dir}/server.conf`, input.configText, { mode: 0o640 });
+  // Older generated configs omitted `dh`; OpenVPN 2.5+ then refuses to start.
+  {
+    const conf = await readFile(`${dir}/server.conf`, "utf8").catch(() => "");
+    if (conf && !/^dh\s+/m.test(conf)) {
+      await writeFile(`${dir}/server.conf`, conf.replace(/^(key\s+.+)$/m, `$1\ndh none`), { mode: 0o640 });
+    }
+  }
+
+
+  // Directories OpenVPN opens after dropping to nobody (status/log/mgmt).
+  const logDir = `/var/log/arvoo/openvpn/${input.inboundName}`;
+  const runDir = `/run/arvoo/openvpn/${input.inboundName}`;
+  await mkdir(logDir, { recursive: true });
+  await mkdir(runDir, { recursive: true });
+  await exec("chown", ["-R", "nobody:nogroup", logDir, runDir]).catch(() => undefined);
+  await exec("chmod", ["0750", logDir, runDir]).catch(() => undefined);
+  // Config dir must stay root-readable for keys; OpenVPN reads PKI before drop.
+  await exec("chmod", ["0755", dir]).catch(() => undefined);
+  await exec("chmod", ["0644", `${dir}/pki/ca.crt`, `${dir}/pki/server.crt`]).catch(() => undefined);
+
 
   // Validate the configuration BEFORE touching the running service:
   // OpenVPN exits non-zero on unknown/invalid directives when asked to just parse.
@@ -777,43 +800,80 @@ export async function applyOpenVPNInbound(
     }
   }
 
-  // Install systemd unit and start
+  // Template unit: %i is the inbound name (instance). Never bake a single
+  // inbound path into the template or a second inbound will point at the first.
+  const unitPath = "/etc/systemd/system/arvoo-openvpn@.service";
   const unit = `[Unit]
-Description=Arvoo OpenVPN inbound ${input.inboundName}
+Description=Arvoo OpenVPN inbound %i
 After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=simple
-ExecStart=/usr/sbin/openvpn --config ${dir}/server.conf
+Type=notify
+NotifyAccess=all
+ExecStart=/usr/sbin/openvpn --config /etc/arvoo/openvpn/%i/server.conf --suppress-timestamps
 Restart=on-failure
-RestartSec=3
+RestartSec=2
+LimitNOFILE=65535
 
 [Install]
 WantedBy=multi-user.target
 `;
-  await writeFile(`/etc/systemd/system/arvoo-openvpn@.service`, unit, { mode: 0o644 }).catch(async () => {
-    await writeFile(`/etc/systemd/system/arvoo-openvpn@${input.inboundName}.service`, unit, { mode: 0o644 });
-  });
+  // Type=notify requires OpenVPN management or --daemon; fall back to simple
+  // if the installed OpenVPN is too old / lacks systemd notify support.
+  const unitSimple = unit.replace("Type=notify\nNotifyAccess=all\n", "Type=simple\n");
+  await writeFile(unitPath, unitSimple, { mode: 0o644 });
   await exec("systemctl", ["daemon-reload"]);
-  const start = await exec("systemctl", ["restart", `arvoo-openvpn@${input.inboundName}`], 30000);
+
+  const service = `arvoo-openvpn@${input.inboundName}`;
+  // Stop any previous instance so a bad config cannot leave a zombie listener.
+  await exec("systemctl", ["stop", service], 15000).catch(() => undefined);
+  const start = await exec("systemctl", ["restart", service], 30000);
   if (start.code !== 0) {
-    return { success: false, error: `systemctl restart failed: ${start.stderr.trim()}` };
-  }
-  const active = await exec("systemctl", ["is-active", `arvoo-openvpn@${input.inboundName}`], 8000);
-  if (active.stdout.trim() !== "active") {
-    const logs = await exec("journalctl", ["-u", `arvoo-openvpn@${input.inboundName}`, "-n", "20", "--no-pager"], 8000);
-    return { success: false, error: `Service did not become active. Recent logs:\n${logs.stdout.trim()}` };
+    const logs = await exec("journalctl", ["-u", service, "-n", "30", "--no-pager"], 8000);
+    return { success: false, error: `systemctl restart failed: ${start.stderr.trim()}\n${logs.stdout.trim()}` };
   }
 
-  // Verify the listening socket. When `ss` is unavailable the systemd check
-  // above (is-active) is the verification we can honestly report.
-  const listening = await portIsListening(input.port, input.protocol);
+  // Wait for the process to become active (OpenVPN may take a moment to parse PKI).
+  let activeState = "";
+  for (let i = 0; i < 10; i++) {
+    const active = await exec("systemctl", ["is-active", service], 5000);
+    activeState = active.stdout.trim();
+    if (activeState === "active") break;
+    if (activeState === "failed" || activeState === "inactive") break;
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  if (activeState !== "active") {
+    const logs = await exec("journalctl", ["-u", service, "-n", "40", "--no-pager"], 8000);
+    const status = await exec("systemctl", ["status", service, "--no-pager", "-l"], 8000);
+    return {
+      success: false,
+      error: `Service did not become active (state=${activeState}).\n${status.stdout.trim()}\n--- journal ---\n${logs.stdout.trim()}`,
+    };
+  }
+
+  // OpenVPN often binds a few hundred ms after the process starts; poll ss.
+  let listening: boolean | null = false;
+  for (let i = 0; i < 12; i++) {
+    listening = await portIsListening(input.port, input.protocol);
+    if (listening === true) break;
+    if (listening === null) break; // ss unavailable
+    await new Promise((r) => setTimeout(r, 500));
+  }
   if (listening === false) {
-    return { success: false, error: `Service is active but port ${input.port}/${input.protocol} is not listening.` };
+    const logs = await exec("journalctl", ["-u", service, "-n", "40", "--no-pager"], 8000);
+    const ssOut = await exec("ss", [input.protocol === "tcp" ? "-ltnp" : "-lunp"], 5000);
+    // Still active?
+    const still = await exec("systemctl", ["is-active", service], 5000);
+    return {
+      success: false,
+      error:
+        `Service is ${still.stdout.trim()} but port ${input.port}/${input.protocol} is not listening after wait.\n` +
+        `ss:\n${ssOut.stdout.trim()}\n--- journal ---\n${logs.stdout.trim()}`,
+    };
   }
 
-  return { success: true, output: { verified: true, port: input.port } };
+  return { success: true, output: { verified: true, port: input.port, protocol: input.protocol } };
 }
 
 export async function deleteOpenVPNInbound(input: { inboundName: string; clientNetwork?: string | null }): Promise<OpResult> {
@@ -898,7 +958,7 @@ export async function cleanupNode(input: CleanupNodeOpInput): Promise<OpResult> 
  */
 export async function killOpenVPNClient(input: { inboundName: string; commonName: string }): Promise<OpResult> {
   if (process.platform !== "linux") return requiresLinux();
-  const socketPath = `/etc/arvoo/openvpn/${input.inboundName}/mgmt.sock`;
+  const socketPath = `/run/arvoo/openvpn/${input.inboundName}/mgmt.sock`;
   const response = await sendManagementCommand(socketPath, `kill ${input.commonName}`).catch((err: Error) => ({ error: err.message }));
   if ("error" in response) return { success: false, error: `management socket: ${response.error}` };
   const killed = /SUCCESS: common name/.test(response.text);

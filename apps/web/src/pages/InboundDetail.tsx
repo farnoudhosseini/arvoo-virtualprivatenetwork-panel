@@ -2,7 +2,7 @@ import { useState } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { Download, Globe, History, Play, RefreshCw, Rocket, RotateCcw, Server, StopCircle, Users } from "lucide-react";
+import { Download, Globe, History, Play, RefreshCw, Rocket, RotateCcw, Server, StopCircle, Trash2, Users } from "lucide-react";
 import { api } from "../lib/api";
 import type { InboundRecord } from "@arvoo/shared";
 import {
@@ -70,6 +70,21 @@ export function InboundDetailPage() {
       invalidate();
     } catch (err) {
       toast.error((err as Error).message);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const removeInbound = async () => {
+    if (!window.confirm(`Delete inbound "${inbound.name}"? Configuration will be removed from the panel and cleanup will be queued on the node.`)) return;
+    setBusy("delete");
+    try {
+      await api.delete(`/inbounds/${id}`);
+      toast.success("Inbound deleted");
+      void queryClient.invalidateQueries({ queryKey: ["inbounds"] });
+      navigate("/inbounds");
+    } catch (e: unknown) {
+      toast.error(e instanceof Error ? e.message : "Delete failed");
     } finally {
       setBusy(null);
     }
@@ -158,8 +173,11 @@ export function InboundDetailPage() {
             <Button size="sm" variant="secondary" onClick={() => lifecycle("stop")} loading={busy === "stop"} disabled={busy === "restart" || busy === "deploy"}>
               <StopCircle size={13} /> Stop
             </Button>
-            <Button size="sm" variant="primary" onClick={deploy} loading={busy === "deploy"} disabled={busy === "restart" || busy === "stop"}>
+            <Button size="sm" variant="primary" onClick={deploy} loading={busy === "deploy"} disabled={busy === "restart" || busy === "stop" || busy === "delete"}>
               <Rocket size={13} /> Deploy v{inbound.currentVersion}
+            </Button>
+            <Button size="sm" variant="danger" onClick={removeInbound} loading={busy === "delete"} disabled={busy === "deploy" || busy === "restart" || busy === "stop"}>
+              <Trash2 size={13} /> Delete
             </Button>
           </>
         }

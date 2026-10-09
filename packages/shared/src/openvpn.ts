@@ -151,7 +151,11 @@ export function generateOpenVPNServerConfig(
 
   push(`# --- Core ---`);
   push(`port ${cfg.port}`);
-  push(`local ${cfg.listenAddress}`);
+  // Omit `local 0.0.0.0` — OpenVPN then binds all interfaces; an explicit
+  // 0.0.0.0 has been observed to confuse some builds / ss checks.
+  if (cfg.listenAddress && cfg.listenAddress !== "0.0.0.0") {
+    push(`local ${cfg.listenAddress}`);
+  }
   push(`proto ${cfg.transport === "udp" ? "udp4" : "tcp4"}`);
   push(`dev ${cfg.device}`);
   push(`topology ${cfg.topology}`);
@@ -170,6 +174,9 @@ export function generateOpenVPNServerConfig(
   push(`ca ${ctx.configDir}/pki/ca.crt`);
   push(`cert ${ctx.configDir}/pki/server.crt`);
   push(`key ${ctx.configDir}/pki/server.key`);
+  // ECDH only — no discrete-log DH file. Required by OpenVPN when --dh is omitted
+  // (otherwise: "Options error: You must define DH file (--dh)").
+  push(`dh none`);
   if (tlsMode === "tls-crypt") push(`tls-crypt ${ctx.configDir}/pki/tls-crypt.key`);
   if (tlsMode === "tls-auth") push(`tls-auth ${ctx.configDir}/pki/tls-auth.key 0`);
   if (authMode === "password") {
@@ -210,12 +217,14 @@ export function generateOpenVPNServerConfig(
   if (cfg.redirectGateway) push(`push "redirect-gateway def1 bypass-dhcp"`);
   for (const r of cfg.pushRoutes) push(`push "route ${r}"`);
   for (const dns of cfg.dnsServers) push(`push "dhcp-option DNS ${dns}"`);
+  // Windows OpenVPN Connect: force VPN DNS so DoH/YouTube does not bypass the tunnel.
+  push(`push "block-outside-dns"`);
   if (cfg.clientToClient) push(`client-to-client`);
   push();
 
   push(`# --- Security / hardening ---`);
-  push(`user nobody`);
-  push(`group nogroup`);
+  // Do NOT drop to nobody: auth-user-pass-verify hooks must read node-secret
+  // and reach the control plane. Privilege drop is left to systemd hardening.
   push(`persist-key`);
   push(`persist-tun`);
   push(`max-clients ${cfg.maxClients}`);
@@ -235,9 +244,10 @@ export function generateOpenVPNServerConfig(
   push();
 
   push(`# --- Logging / status ---`);
-  push(`status ${ctx.configDir}/status.log 1`);
-  push(`management ${ctx.configDir}/mgmt.sock unix`);
-  push(`log-append ${ctx.configDir}/openvpn.log`);
+  // Writable by `nobody` after privilege drop (agent creates these dirs).
+  push(`status /var/log/arvoo/openvpn/${ctx.inboundName}/status.log 1`);
+  push(`management /run/arvoo/openvpn/${ctx.inboundName}/mgmt.sock unix`);
+  push(`log-append /var/log/arvoo/openvpn/${ctx.inboundName}/openvpn.log`);
   push(`verb ${cfg.logVerbosity}`);
   push();
 
@@ -337,6 +347,7 @@ export function generateClientOvpn(opts: {
   if (opts.mssFix != null) lines.push(`mssfix ${opts.mssFix}`);
   if (opts.redirectGateway) lines.push(`redirect-gateway def1 bypass-dhcp`);
   for (const dns of opts.dnsServers) lines.push(`dhcp-option DNS ${dns}`);
+  lines.push(`block-outside-dns`);
   for (const r of opts.pushRoutes) lines.push(`route ${r}`);
   if (opts.authMode === "password" || opts.authMode === "certificate+password") {
     // Prompts for the OpenVPN username/password issued in the panel. These are
