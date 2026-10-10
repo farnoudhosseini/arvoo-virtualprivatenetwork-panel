@@ -47,7 +47,7 @@ export function defaultFirewallPolicy(): FirewallPolicy {
     restrictPanel: false,
     exposeApiPort: false,
     allowIcmp: true,
-    includeInactiveInbounds: false,
+    includeInactiveInbounds: true,
     extraRules: [],
   };
 }
@@ -179,7 +179,9 @@ function plannedInbounds(rows: Array<{ name: string; structured_config: string; 
         name: row.name,
         port: Number(cfg.port),
         proto: cfg.transport === "tcp" ? "tcp" : "udp",
-        active: row.status === "active" || row.status === "deploying",
+        // Open the listen port whenever the inbound exists and is not explicitly stopped.
+        // Failed deploys still need the port so operators can redeploy without UFW blocking them.
+        active: row.status !== "stopped" && row.status !== "deleted",
       });
     } catch {
       // An unreadable configuration is reported by the inbound page, not here.

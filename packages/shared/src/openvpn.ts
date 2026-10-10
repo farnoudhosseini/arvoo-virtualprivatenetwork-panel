@@ -23,17 +23,22 @@ export const PERFORMANCE_PROFILES: Record<PerformanceProfile, ProfileNotes> = {
   balanced: {
     label: "Balanced",
     rationale:
-      "Safe general-purpose defaults: UDP transport, sane socket buffers, standard keepalive.",
+      "Safe general-purpose defaults: sane socket buffers, standard keepalive. Works on UDP or TCP.",
   },
   "low-latency": {
     label: "Low Latency",
     rationale:
-      "Prioritises response time: UDP, fast-io, tighter keepalive for quick failover detection, TCP_NODELAY for TCP transport.",
+      "Minimises RTT: tcp-nodelay, modest buffers, tight keepalive, fast-io on UDP. Best for interactive use.",
   },
   throughput: {
     label: "High Throughput",
     rationale:
-      "Prioritises sustained transfer: enlarged socket buffers, longer keepalive to avoid dropping healthy-but-busy sessions.",
+      "Maximises Mbps: large socket buffers (512KB), longer keepalive. Prefer for downloads on stable links.",
+  },
+  "tcp-boost": {
+    label: "TCP Boost",
+    rationale:
+      "Optimised for TCP transport under restrictive networks (e.g. UDP blocked): large buffers, TCP_NODELAY, tuned MSS/MTU for tunnel overhead.",
   },
   compatibility: {
     label: "Compatibility",
@@ -59,31 +64,57 @@ export interface ProfileAdjustments {
   tcpNodelay: boolean;
   explicitExitNotify: boolean;
   tlsMode: "tls-crypt" | "tls-auth" | "none";
+  /** Preferred tun-mtu hint for this profile (null = leave config value). */
+  preferredTunMtu: number | null;
+  preferredMssFix: number | null;
+  txqueuelen: number;
 }
 
 export function profileAdjustments(profile: PerformanceProfile): ProfileAdjustments {
   switch (profile) {
     case "low-latency":
       return {
-        sndbuf: 0,
-        rcvbuf: 0,
+        sndbuf: 212992,
+        rcvbuf: 212992,
         keepaliveInterval: 5,
         keepaliveTimeout: 30,
         fastIo: true,
         tcpNodelay: true,
         explicitExitNotify: true,
         tlsMode: "tls-crypt",
+        preferredTunMtu: 1400,
+        preferredMssFix: 1360,
+        txqueuelen: 100,
       };
     case "throughput":
       return {
-        sndbuf: 524288,
-        rcvbuf: 524288,
+        sndbuf: 1048576,
+        rcvbuf: 1048576,
         keepaliveInterval: 10,
         keepaliveTimeout: 120,
         fastIo: true,
-        tcpNodelay: false,
+        tcpNodelay: true,
         explicitExitNotify: true,
         tlsMode: "tls-crypt",
+        preferredTunMtu: 1400,
+        preferredMssFix: 1360,
+        txqueuelen: 500,
+      };
+    case "tcp-boost":
+      // Tuned for TCP-only paths (UDP filtered). Large buffers + nodelay reduce
+      // ACK compression delay; MSS/MTU leave headroom for GRE+OpenVPN overhead.
+      return {
+        sndbuf: 1048576,
+        rcvbuf: 1048576,
+        keepaliveInterval: 8,
+        keepaliveTimeout: 45,
+        fastIo: false, // fast-io is UDP-only
+        tcpNodelay: true,
+        explicitExitNotify: false,
+        tlsMode: "tls-crypt",
+        preferredTunMtu: 1360,
+        preferredMssFix: 1320,
+        txqueuelen: 1000,
       };
     case "compatibility":
       return {
@@ -95,18 +126,24 @@ export function profileAdjustments(profile: PerformanceProfile): ProfileAdjustme
         tcpNodelay: false,
         explicitExitNotify: false,
         tlsMode: "tls-auth",
+        preferredTunMtu: null,
+        preferredMssFix: null,
+        txqueuelen: 100,
       };
     case "balanced":
     default:
       return {
-        sndbuf: 0,
-        rcvbuf: 0,
+        sndbuf: 393216,
+        rcvbuf: 393216,
         keepaliveInterval: 10,
         keepaliveTimeout: 60,
         fastIo: true,
-        tcpNodelay: false,
+        tcpNodelay: true,
         explicitExitNotify: true,
         tlsMode: "tls-crypt",
+        preferredTunMtu: 1400,
+        preferredMssFix: 1360,
+        txqueuelen: 200,
       };
   }
 }
@@ -200,14 +237,21 @@ export function generateOpenVPNServerConfig(
   push();
 
   push(`# --- Performance ---`);
-  push(`tun-mtu ${cfg.tunMtu}`);
-  if (cfg.mssFix != null) push(`mssfix ${cfg.mssFix}`);
+  const tunMtu = cfg.tunMtu || adj.preferredTunMtu || 1400;
+  const mssFix = cfg.mssFix ?? adj.preferredMssFix;
+  push(`tun-mtu ${tunMtu}`);
+  if (mssFix != null) push(`mssfix ${mssFix}`);
   if (cfg.fragment != null) push(`fragment ${cfg.fragment}`);
+  // Always set socket buffers for TCP and for throughput-oriented profiles.
   if (adj.sndbuf > 0) {
     push(`sndbuf ${adj.sndbuf}`);
     push(`rcvbuf ${adj.rcvbuf}`);
+    push(`push "sndbuf ${adj.sndbuf}"`);
+    push(`push "rcvbuf ${adj.rcvbuf}"`);
   }
+  if (adj.txqueuelen > 0) push(`txqueuelen ${adj.txqueuelen}`);
   if (adj.fastIo && cfg.transport === "udp") push(`fast-io`);
+  // TCP_NODELAY is critical on TCP transport under high RTT (e.g. IR↔TR).
   if (adj.tcpNodelay && cfg.transport === "tcp") push(`tcp-nodelay`);
   push(`keepalive ${cfg.keepaliveInterval} ${cfg.keepaliveTimeout}`);
   if (cfg.transport === "udp" && adj.explicitExitNotify) push(`explicit-exit-notify 1`);
@@ -244,8 +288,9 @@ export function generateOpenVPNServerConfig(
   push();
 
   push(`# --- Logging / status ---`);
-  // Writable by `nobody` after privilege drop (agent creates these dirs).
+  // status-version 3 produces CLIENT_LIST CSV that the agent parses for usage.
   push(`status /var/log/arvoo/openvpn/${ctx.inboundName}/status.log 1`);
+  push(`status-version 3`);
   push(`management /run/arvoo/openvpn/${ctx.inboundName}/mgmt.sock unix`);
   push(`log-append /var/log/arvoo/openvpn/${ctx.inboundName}/openvpn.log`);
   push(`verb ${cfg.logVerbosity}`);

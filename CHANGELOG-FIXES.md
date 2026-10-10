@@ -1,31 +1,36 @@
-# Arvoo panel fixes (session summary)
+# Arvoo update — quality, TCP boost, traffic, UFW, edit
 
-## OpenVPN connectivity
-- Client profile: correct `tls-crypt` inline blocks, `verify-x509-name "CN" name`
-- Server config: `dh none` (fixes "You must define DH file")
-- Do not drop to `nobody` (auth hooks need node-secret + control plane)
-- `block-outside-dns` for Windows DNS / streaming sites
-- Agent: create `/var/log` + `/run` dirs; inject `dh none` if missing; wait for port listen
-- Auth hook JS: fixed broken regex escaping; use HTTP control plane URL when needed
-- Egress payload: `masqueradeSourceNetworks` always an array; through-tunnel uses null on OpenVPN op + ApplyFirewallPolicy on egress node
+## Critical fixes
+1. **Client traffic was always zero**
+   - Status path was `/var/log/arvoo/...` but agent read `/etc/arvoo/...`
+   - Missing `status-version 3` so CSV CLIENT_LIST was never produced
+   - Parser now supports v1 + v3 and both paths
 
-## Through-tunnel routing
-- Documented/required: policy route table from VPN subnet via GRE; NAT on egress node only
-- Local eth0 MASQUERADE on ingress breaks "tunnel exit IP" — remove it for through-tunnel
+2. **UFW too tight**
+   - Inbound ports now open for any non-stopped inbound (not only status=active)
+   - `includeInactiveInbounds` defaults to true
+   - GRE + FOU + IPsec peer rules still built from tunnels
 
-## Installer / panel
-- ACME email: never `root@hostname`; use `admin@domain` / ARVOO_EMAIL
-- No duplicate nginx `default_server` (public site vs panel)
-- Panel URL `/panel/` on ports 80/443; API loopback `:4001`
-- Final report prints Panel URL, public ports, path
-- Node install: auto-build agent when `dist/` missing
-- Control-plane health check clearer errors; HTTP `/health` + `/api` without forced HTTPS redirect
+3. **OpenVPN reliability** (previous session, kept)
+   - `dh none`, no `user nobody`, auth hook fixed, HTTP control plane when needed
 
-## UI
-- Inbound detail: **Delete** button (calls DELETE /api/v1/inbounds/:id)
-- API already had PATCH update + DELETE; deploy/restart/stop present
+## New performance
+- Profile **`tcp-boost`**: 1MB sndbuf/rcvbuf, TCP_NODELAY, MTU 1360 / MSS 1320, high txqueuelen — for TCP-only paths (UDP blocked in IR)
+- **low-latency / throughput / balanced** retuned with larger buffers and tcp-nodelay on TCP
+- Server pushes sndbuf/rcvbuf to clients
 
-## Operator notes
-1. Agent control plane URL for this network may need `http://` if HTTPS path drops responses after TLS
-2. After deploy, verify: `ss -ltnp | grep PORT`, auth hook `hook_exit=0`, `ip rule` for through-tunnel
-3. Re-deploy inbound after pulling these sources so server.conf regenerates with dh none / no nobody / block-outside-dns
+## Panel control
+- Inbound **Delete** + **Edit configuration** (profile, MTU, MSS) then Deploy
+- Tunnel create: optional **FOU UDP port** for GRE-over-UDP
+- Profile list includes TCP Boost in the builder
+
+## Safe panel updates
+- `./install.sh --update` rebuilds panel only; does **not** restart OpenVPN/GRE on nodes
+- Update agents with `./install.sh --node` when agent code changes; OpenVPN processes keep running until an inbound Deploy
+
+## Operator tips (Iran / TCP)
+1. Create inbound with transport **TCP**, profile **tcp-boost**
+2. Through-tunnel: policy route VPN subnet via GRE; NAT only on egress
+3. After this update: Deploy inbound once so status-version 3 + buffers apply
+4. Re-apply UFW from panel after update so ports open correctly
+5. YouTube: `block-outside-dns` in config; client may still need browser QUIC off on some paths

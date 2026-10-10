@@ -2,15 +2,20 @@
 export const PROFILE_DESCRIPTIONS: Record<string, { label: string; rationale: string }> = {
   balanced: {
     label: "Balanced",
-    rationale: "Safe general-purpose defaults: UDP transport, sane socket buffers, standard keepalive.",
+    rationale: "Safe general-purpose defaults: sane socket buffers, standard keepalive. Works on UDP or TCP.",
   },
   "low-latency": {
     label: "Low Latency",
-    rationale: "Prioritises response time: fast-io, tighter keepalive for quick failover detection, TCP_NODELAY on TCP.",
+    rationale: "Minimises RTT: tcp-nodelay, modest buffers, tight keepalive. Best for interactive use.",
+  },
+  "tcp-boost": {
+    label: "TCP Boost",
+    rationale:
+      "Optimised for TCP when UDP is blocked: 1MB socket buffers, TCP_NODELAY, tuned MSS/MTU for GRE+OpenVPN overhead. Aim for higher Mbps and lower ACK delay.",
   },
   throughput: {
     label: "High Throughput",
-    rationale: "Prioritises sustained transfer: enlarged socket buffers (512 KB), longer keepalive to avoid dropping busy sessions.",
+    rationale: "Maximises Mbps: large socket buffers (1 MB), longer keepalive. Prefer for downloads on stable links.",
   },
   compatibility: {
     label: "Compatibility",

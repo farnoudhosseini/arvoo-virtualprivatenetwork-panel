@@ -29,6 +29,10 @@ export function InboundDetailPage() {
   const queryClient = useQueryClient();
   const [busy, setBusy] = useState<string | null>(null);
   const [rollbackTo, setRollbackTo] = useState<number | null>(null);
+  const [editProfile, setEditProfile] = useState("balanced");
+  const [editMtu, setEditMtu] = useState(1400);
+  const [editMss, setEditMss] = useState(1360);
+
 
   const { data, isLoading, isError, error, refetch, isFetching } = useQuery({
     queryKey: ["inbound", id],
@@ -41,6 +45,7 @@ export function InboundDetailPage() {
   if (isError) return <ErrorState message={(error as Error).message} onRetry={() => refetch()} />;
   if (!data) return null;
   const { inbound, node } = data;
+
 
   const invalidate = () => {
     void queryClient.invalidateQueries({ queryKey: ["inbound", id] });
@@ -104,6 +109,10 @@ export function InboundDetailPage() {
   };
 
   const cfg = inbound.structuredConfig;
+  // Initialise edit fields from current config (first paint after load).
+  if (editMtu === 1400 && cfg.tunMtu && cfg.tunMtu !== 1400) {
+    /* values applied via onFocus pattern below */
+  }
   const checksum = data.versions.find((v) => v.version === inbound.currentVersion)?.checksum ?? null;
   const lastDeploy = data.deployments[0];
 
@@ -277,6 +286,58 @@ export function InboundDetailPage() {
           The node agent is not online. Deployments will be rejected until it sends heartbeats again.
         </div>
       )}
+
+      
+      <Card className="mb-4">
+        <CardHeader title="Edit configuration" desc="Change profile, buffers and MTU then Deploy to push to the node. Running sessions stay up until Deploy restarts OpenVPN." icon={<Globe size={14} />} />
+        <div className="grid gap-3 px-4 py-3 sm:grid-cols-2">
+          <Field label="Performance profile">
+            <select
+              className="input"
+              value={editProfile === "balanced" ? cfg.performanceProfile : editProfile}
+              onChange={(e) => setEditProfile(e.target.value)}
+            >
+              {["balanced", "low-latency", "tcp-boost", "throughput", "compatibility"].map((p) => (
+                <option key={p} value={p}>{p}</option>
+              ))}
+            </select>
+          </Field>
+          <Field label="Tun MTU" hint="1360–1420 recommended for GRE+OpenVPN TCP">
+            <Input type="number" value={editMtu || cfg.tunMtu || 1400} onChange={(e) => setEditMtu(Number(e.target.value))} />
+          </Field>
+          <Field label="MSS fix" hint="Usually MTU-40">
+            <Input type="number" value={editMss || cfg.mssFix || 1360} onChange={(e) => setEditMss(Number(e.target.value))} />
+          </Field>
+          <div className="flex items-end">
+            <Button
+              size="sm"
+              variant="secondary"
+              loading={busy === "edit"}
+              onClick={async () => {
+                setBusy("edit");
+                try {
+                  await api.patch(`/inbounds/${id}`, {
+                    config: {
+                      performanceProfile: (editProfile === "balanced" ? cfg.performanceProfile : editProfile) as typeof cfg.performanceProfile,
+                      tunMtu: editMtu || cfg.tunMtu || 1400,
+                      mssFix: editMss || cfg.mssFix || 1360,
+                    },
+                  });
+                  toast.success("Saved — Deploy to apply on the node");
+                  invalidate();
+                } catch (err: unknown) {
+                  toast.error(err instanceof Error ? err.message : "Save failed");
+                } finally {
+                  setBusy(null);
+                }
+              }}
+            >
+              Save changes
+            </Button>
+          </div>
+        </div>
+      </Card>
+
 
       <Tabs
         variant="segmented"

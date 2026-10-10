@@ -196,7 +196,7 @@ export interface NodeHealthSample {
 export type VpnProtocol = "openvpn";
 export type TransportProtocol = "udp" | "tcp";
 export type InboundStatus = "draft" | "active" | "deploying" | "error" | "stopped";
-export type PerformanceProfile = "balanced" | "low-latency" | "throughput" | "compatibility";
+export type PerformanceProfile = "balanced" | "low-latency" | "throughput" | "tcp-boost" | "compatibility";
 export type TlsMode = "tls-crypt" | "tls-auth" | "none";
 /**
  * How a client proves who it is to OpenVPN:

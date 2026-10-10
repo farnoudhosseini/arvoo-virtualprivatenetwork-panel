@@ -277,6 +277,7 @@ function NewTunnelDrawer({ open, onClose, onCreated }: { open: boolean; onClose:
     queryFn: () => api.get<{ nodes: Array<{ id: string; name: string; enrollmentState: string; status: string; address: string | null }> }>("/nodes"),
     enabled: open,
   });
+  const [fouPort, setFouPort] = useState("");
   const [pathMtu, setPathMtu] = useState("1500");
   const [keyMode, setKeyMode] = useState<"auto" | "custom" | "none">("auto");
   const [customKey, setCustomKey] = useState("");
@@ -313,6 +314,7 @@ function NewTunnelDrawer({ open, onClose, onCreated }: { open: boolean; onClose:
         key: keyMode === "none" ? false : keyMode === "custom" ? canonicalKey : true,
         pathMtu: Number(pathMtu) || 1500,
         mtuOverride: mtuOverride ? Number(mtuOverride) : null,
+        fouPort: fouPort.trim() ? Number(fouPort) : null,
       });
       toast.success(`Tunnel ${res.tunnel.name} created — deploying to both nodes`);
       onCreated();
@@ -383,6 +385,16 @@ function NewTunnelDrawer({ open, onClose, onCreated }: { open: boolean; onClose:
               </p>
             </Field>
           )}
+
+          <Field label="FOU UDP port (optional)" hint="When pure GRE (IP protocol 47) is blocked, encapsulate GRE in UDP on this port (1024–65535). Leave empty for native GRE.">
+            <Input
+              value={fouPort}
+              onChange={(e) => setFouPort(e.target.value)}
+              placeholder="e.g. 5555"
+              className="mono"
+              inputMode="numeric"
+            />
+          </Field>
 
           {eligible.length < 2 && (
             <p className="rounded-default border border-warning/25 bg-warning-soft px-3 py-2 text-2xs leading-relaxed text-warning">

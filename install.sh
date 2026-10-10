@@ -1487,6 +1487,8 @@ mode_update() {
 
   if health_report; then
     ok "update complete (revision $(git -C "$INSTALL_ROOT" rev-parse --short HEAD))"
+    ok "OpenVPN inbounds and GRE tunnels were NOT restarted — existing sessions stay up"
+    ok "Nodes keep serving; only the panel API/web were rebuilt. Update agents separately with: ./install.sh --node"
     return 0
   fi
 
